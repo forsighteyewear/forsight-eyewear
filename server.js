@@ -3,6 +3,8 @@ import cors from 'cors';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
 import crypto from 'crypto';
+import cron from 'node-cron';
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 
 dotenv.config();
 
@@ -295,7 +297,6 @@ app.post('/api/generate-brand-description', async (req, res) => {
       throw new Error(result.error?.message || "Failed to generate description");
     }
 
-    // Extracting text from Responses API format
     const generatedText = result.output_text?.trim() || "Generated description.";
     res.json({ description: generatedText });
   } catch (error) {
@@ -303,12 +304,10 @@ app.post('/api/generate-brand-description', async (req, res) => {
     res.status(500).json({ message: error.message || "Internal server error" });
   }
 });
+
 // ============================================================
 // CRM ↔ Supabase Bidirectional Sync
 // ============================================================
-
-import cron from 'node-cron';
-import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 
 /**
  * Fetch all contacts from the CRM with pagination.
@@ -445,8 +444,7 @@ async function uploadCMSToSupabase(supabaseConfig, cmsData) {
 }
 
 /**
- * Deduplicate referral clients by phone, email, and referral code.
- * Merges duplicate groups into a single record, combining rewards and notes.
+ * Deduplicate referral clients by phone, email, name, and referral code.
  */
 function deduplicateClients(clients) {
   const normalize = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -526,30 +524,21 @@ function deduplicateClients(clients) {
 
   return { clients: finalClients, duplicatesRemoved, duplicateGroups: groups.length };
 }
-server.js — Part 3 (lines 531–741)
+
 /**
- * Perform a full bidirectional sync:
- * 1. Download CMS data from Supabase
- * 2. Fetch all contacts from CRM
- * 3. Merge: update existing clients, add new ones, generate missing referral codes
- * 4. Deduplicate merged clients (by phone, email, referral code)
- * 5. Push missing referral codes back to CRM
- * 6. Upload deduplicated CMS data back to Supabase
+ * Perform a full bidirectional sync.
  */
 async function performCRMSync(crmConfig, supabaseConfig) {
   console.log(`[${new Date().toISOString()}] Starting CRM ↔ Supabase sync...`);
 
-  // Step 1: Download current CMS data from Supabase
   const cmsData = await downloadCMSFromSupabase(supabaseConfig);
   if (!cmsData) {
     throw new Error('Could not download CMS data from Supabase. Check bucket config.');
   }
 
-  // Step 2: Fetch all contacts from CRM
   const crmClients = await fetchAllCRMContacts(crmConfig);
   console.log(`  Fetched ${crmClients.length} contacts from CRM`);
 
-  // Step 3: Merge by ID, email, phone, or referral code
   const existingClients = [...(cmsData.referralClients || [])];
   const mergedClients = [...existingClients];
   const codesToPush = [];
@@ -607,13 +596,11 @@ async function performCRMSync(crmConfig, supabaseConfig) {
 
   console.log(`  Merged to ${mergedClients.length} total clients (${codesToPush.length} codes to push back)`);
 
-  // Step 4: Deduplicate merged clients before pushing to CRM / Supabase
   const { clients: dedupedClients, duplicatesRemoved, duplicateGroups } = deduplicateClients(mergedClients);
   if (duplicatesRemoved > 0) {
     console.log(`  Deduplicated: removed ${duplicatesRemoved} duplicates across ${duplicateGroups} groups (${mergedClients.length} → ${dedupedClients.length})`);
   }
 
-  // Step 5: Push missing referral codes back to CRM
   for (const item of codesToPush) {
     await pushReferralCodeToCRMContact(crmConfig, item.id, item.code);
   }
@@ -621,17 +608,16 @@ async function performCRMSync(crmConfig, supabaseConfig) {
     console.log(`  Pushed ${codesToPush.length} referral codes back to CRM`);
   }
 
-  // Step 6: Upload deduplicated CMS data back to Supabase
   cmsData.referralClients = dedupedClients;
   cmsData.lastCRMSync = new Date().toISOString();
   await uploadCMSToSupabase(supabaseConfig, cmsData);
 
   console.log(`[${new Date().toISOString()}] Sync complete. ${dedupedClients.length} clients, ${codesToPush.length} codes pushed, ${duplicatesRemoved} duplicates removed.`);
-  return { synced: crmClients.length, total: dedupedClients.length, codesPushed: codesToPush.length, duplicatesRemoved, duplicateGroups };
+  return { synced: crmClients.length, total: dedupedClients.length, codesPushed: codesToPush.length, duplicatesRemoved, duplicateGroups, clients: dedupedClients, syncTime: new Date().toISOString() };
 }
 
 // ============================================================
-// Referral SMS — send referral link via text message
+// Referral SMS
 // ============================================================
 
 app.post('/api/send-referral-sms', async (req, res) => {
@@ -670,7 +656,47 @@ app.post('/api/send-referral-sms', async (req, res) => {
   }
 });
 
-// Manual sync endpoint (called by Admin "Sync Now" button)
+// CRM connection test endpoint
+app.post('/api/crm-test', async (req, res) => {
+  try {
+    const { crmConfig } = req.body;
+    if (!crmConfig || !crmConfig.apiBase || !crmConfig.apiKey || !crmConfig.locationId) {
+      return res.status(400).json({ message: 'CRM config is incomplete. Set apiBase, apiKey, and locationId.' });
+    }
+
+    const testUrl = `${crmConfig.apiBase}/contacts/?locationId=${crmConfig.locationId}&limit=1`;
+    const response = await fetch(testUrl, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${crmConfig.apiKey}`,
+        'Content-Type': 'application/json',
+        'Version': '2021-07-28',
+      },
+    });
+
+    if (response.ok) {
+      const result = await response.json();
+      const totalContacts = result.meta?.total || result.contacts?.length || 0;
+      res.json({ success: true, totalContacts });
+    } else {
+      let errMsg = `HTTP ${response.status}`;
+      let rawBody = '';
+      try {
+        rawBody = await response.text();
+        const errBody = JSON.parse(rawBody);
+        errMsg = errBody.message || errBody.error || errBody.errorMessage || rawBody;
+      } catch (_) {
+        if (rawBody) errMsg = rawBody;
+      }
+      res.status(response.status).json({ message: errMsg, statusCode: response.status, rawBody });
+    }
+  } catch (error) {
+    console.error('CRM Test Error:', error.message);
+    res.status(500).json({ message: error.message || 'Connection test failed' });
+  }
+});
+
+// Manual sync endpoint
 app.post('/api/crm-sync', async (req, res) => {
   try {
     const { crmConfig, supabaseConfig } = req.body;
@@ -683,7 +709,7 @@ app.post('/api/crm-sync', async (req, res) => {
     }
 
     const result = await performCRMSync(crmConfig, supabaseConfig);
-    res.json({ success: true, ...result, syncTime: new Date().toISOString() });
+    res.json({ success: true, ...result });
   } catch (error) {
     console.error('CRM Sync Error:', error.message);
     res.status(500).json({ message: error.message || 'Sync failed' });
@@ -691,15 +717,14 @@ app.post('/api/crm-sync', async (req, res) => {
 });
 
 // ============================================================
-// Daily Cron Job — runs at 3:00 AM server time
+// Daily Cron Job
 // ============================================================
 
-const CRON_SCHEDULE = process.env.CRM_SYNC_CRON || '0 3 * * *'; // default: 3 AM daily
+const CRON_SCHEDULE = process.env.CRM_SYNC_CRON || '0 3 * * *';
 
 cron.schedule(CRON_SCHEDULE, async () => {
   console.log(`[${new Date().toISOString()}] Daily CRM sync cron triggered`);
 
-  // The cron needs the CRM + Supabase config. These come from environment variables.
   const crmConfig = {
     apiBase: process.env.CRM_API_BASE,
     apiKey: process.env.CRM_API_KEY,
@@ -716,7 +741,7 @@ cron.schedule(CRON_SCHEDULE, async () => {
   };
 
   if (!crmConfig.apiBase || !crmConfig.apiKey || !crmConfig.locationId) {
-    console.warn('Cron sync skipped: CRM env vars not set (CRM_API_BASE, CRM_API_KEY, CRM_LOCATION_ID)');
+    console.warn('Cron sync skipped: CRM env vars not set');
     return;
   }
 
@@ -738,44 +763,4 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-Summary
-That's the complete server.js in 3 parts. Paste all 3 parts into a single file called server.js on GitHub (Part 1 first, then Part 2, then Part 3 — no gaps between them).
 
-Then on Render:
-
-Build Command: npm install
-Start Command: node server.js
-Add the environment variables from the DEPLOYMENT.md table
-Deploy — then paste the Render URL into Admin → CRM & Settings → Backend Server URL
-
-
-
-
-
-how do i create pakage.json
-
-
-Thought for 6s
-You already have the content — I provided it in my last message. Here's exactly what to do:
-
-Create package.json on GitHub
-In your new GitHub repo, click "Add file" → "Create new file"
-Name it exactly: package.json
-Paste this content:
-{
-  "name": "forsight-backend",
-  "version": "1.0.0",
-  "type": "module",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "@supabase/supabase-js": "^2.112.3",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.0",
-    "node-cron": "^4.6.0",
-    "node-fetch": "^3.3.2"
-  }
-}
