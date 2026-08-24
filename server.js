@@ -1,4 +1,4 @@
-import express from 'express';
+ import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
@@ -297,6 +297,7 @@ app.post('/api/generate-brand-description', async (req, res) => {
       throw new Error(result.error?.message || "Failed to generate description");
     }
 
+    // Extracting text from Responses API format
     const generatedText = result.output_text?.trim() || "Generated description.";
     res.json({ description: generatedText });
   } catch (error) {
@@ -444,7 +445,8 @@ async function uploadCMSToSupabase(supabaseConfig, cmsData) {
 }
 
 /**
- * Deduplicate referral clients by phone, email, name, and referral code.
+ * Deduplicate referral clients by phone, email, and referral code.
+ * Merges duplicate groups into a single record, combining rewards and notes.
  */
 function deduplicateClients(clients) {
   const normalize = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -526,19 +528,28 @@ function deduplicateClients(clients) {
 }
 
 /**
- * Perform a full bidirectional sync.
+ * Perform a full bidirectional sync:
+ * 1. Download CMS data from Supabase
+ * 2. Fetch all contacts from CRM
+ * 3. Merge: update existing clients, add new ones, generate missing referral codes
+ * 4. Deduplicate merged clients (by phone, email, referral code)
+ * 5. Push missing referral codes back to CRM
+ * 6. Upload deduplicated CMS data back to Supabase
  */
 async function performCRMSync(crmConfig, supabaseConfig) {
   console.log(`[${new Date().toISOString()}] Starting CRM ↔ Supabase sync...`);
 
+  // Step 1: Download current CMS data from Supabase
   const cmsData = await downloadCMSFromSupabase(supabaseConfig);
   if (!cmsData) {
     throw new Error('Could not download CMS data from Supabase. Check bucket config.');
   }
 
+  // Step 2: Fetch all contacts from CRM
   const crmClients = await fetchAllCRMContacts(crmConfig);
   console.log(`  Fetched ${crmClients.length} contacts from CRM`);
 
+  // Step 3: Merge by ID, email, phone, or referral code
   const existingClients = [...(cmsData.referralClients || [])];
   const mergedClients = [...existingClients];
   const codesToPush = [];
@@ -596,11 +607,13 @@ async function performCRMSync(crmConfig, supabaseConfig) {
 
   console.log(`  Merged to ${mergedClients.length} total clients (${codesToPush.length} codes to push back)`);
 
+  // Step 4: Deduplicate merged clients before pushing to CRM / Supabase
   const { clients: dedupedClients, duplicatesRemoved, duplicateGroups } = deduplicateClients(mergedClients);
   if (duplicatesRemoved > 0) {
     console.log(`  Deduplicated: removed ${duplicatesRemoved} duplicates across ${duplicateGroups} groups (${mergedClients.length} → ${dedupedClients.length})`);
   }
 
+  // Step 5: Push missing referral codes back to CRM
   for (const item of codesToPush) {
     await pushReferralCodeToCRMContact(crmConfig, item.id, item.code);
   }
@@ -608,6 +621,7 @@ async function performCRMSync(crmConfig, supabaseConfig) {
     console.log(`  Pushed ${codesToPush.length} referral codes back to CRM`);
   }
 
+  // Step 6: Upload deduplicated CMS data back to Supabase
   cmsData.referralClients = dedupedClients;
   cmsData.lastCRMSync = new Date().toISOString();
   await uploadCMSToSupabase(supabaseConfig, cmsData);
@@ -617,7 +631,106 @@ async function performCRMSync(crmConfig, supabaseConfig) {
 }
 
 // ============================================================
-// Referral SMS
+// Customer Documents — list & delete documents in Supabase storage
+// ============================================================
+
+app.post('/api/customer-documents/list', async (req, res) => {
+  try {
+    const { supabaseConfig, clientId } = req.body;
+    if (!supabaseConfig?.url || !supabaseConfig?.anonKey || !supabaseConfig?.bucket) {
+      return res.status(400).json({ message: 'Supabase config required' });
+    }
+    const supabase = createSupabaseClient(supabaseConfig.url, supabaseConfig.anonKey);
+    const { data: files, error } = await supabase.storage
+      .from(supabaseConfig.bucket)
+      .list('customer-docs', { limit: 500, sortBy: { column: 'created_at', order: 'desc' } });
+
+    if (error) throw error;
+
+    const docs = (files || [])
+      .filter((f) => f.name.startsWith(clientId + '__'))
+      .map((f) => {
+        const parts = f.name.split('__');
+        return {
+          id: f.id || f.name,
+          fileName: parts.slice(2).join('__') || f.name,
+          fileType: f.metadata?.mimetype || 'application/octet-stream',
+          fileSize: f.metadata?.size || 0,
+          uploadedAt: f.created_at || new Date().toISOString(),
+          category: parts[1] || 'General',
+          url: `${supabaseConfig.url}/storage/v1/object/public/${supabaseConfig.bucket}/customer-docs/${encodeURIComponent(f.name)}`,
+          path: `customer-docs/${f.name}`,
+        };
+      });
+
+    res.json({ success: true, documents: docs });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to list documents' });
+  }
+});
+
+app.post('/api/customer-documents/delete', async (req, res) => {
+  try {
+    const { supabaseConfig, path } = req.body;
+    if (!supabaseConfig?.url || !supabaseConfig?.anonKey || !supabaseConfig?.bucket || !path) {
+      return res.status(400).json({ message: 'Supabase config and file path required' });
+    }
+    const supabase = createSupabaseClient(supabaseConfig.url, supabaseConfig.anonKey);
+    const { error } = await supabase.storage.from(supabaseConfig.bucket).remove([path]);
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to delete document' });
+  }
+});
+
+// ============================================================
+// CRM Documents — fetch documents uploaded to a CRM contact
+// ============================================================
+
+app.post('/api/crm-documents/list', async (req, res) => {
+  try {
+    const { crmConfig, contactId } = req.body;
+    if (!crmConfig?.apiBase || !crmConfig?.apiKey || !crmConfig?.locationId || !contactId) {
+      return res.status(400).json({ message: 'crmConfig (apiBase, apiKey, locationId) and contactId are required' });
+    }
+
+    // Fetch documents associated with the contact from the CRM
+    const docUrl = `${crmConfig.apiBase}/contacts/${contactId}/documents`;
+    const response = await fetch(docUrl, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${crmConfig.apiKey}`,
+        'Content-Type': 'application/json',
+        'Version': '2021-07-28',
+      },
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return res.status(response.status).json({ message: `CRM API Error: ${response.status} - ${errText}` });
+    }
+
+    const result = await response.json();
+    const documents = (result.documents || result.files || result.data || []).map((d) => ({
+      id: d.id || d.documentId || '',
+      fileName: d.name || d.fileName || d.originalName || 'Unknown',
+      fileType: d.mimeType || d.fileType || d.contentType || 'application/octet-stream',
+      fileSize: d.size || d.fileSize || 0,
+      uploadedAt: d.uploadedAt || d.createdAt || d.dateAdded || new Date().toISOString(),
+      category: d.category || d.documentType || 'CRM Document',
+      url: d.url || d.downloadUrl || d.fileUrl || '',
+      source: 'crm',
+    }));
+
+    res.json({ success: true, documents });
+  } catch (error) {
+    res.status(500).json({ message: error.message || 'Failed to fetch CRM documents' });
+  }
+});
+
+// ============================================================
+// Referral SMS — send referral link via text message
 // ============================================================
 
 app.post('/api/send-referral-sms', async (req, res) => {
@@ -656,7 +769,7 @@ app.post('/api/send-referral-sms', async (req, res) => {
   }
 });
 
-// CRM connection test endpoint
+// CRM connection test endpoint (called by Admin "Test Connection" button)
 app.post('/api/crm-test', async (req, res) => {
   try {
     const { crmConfig } = req.body;
@@ -679,6 +792,7 @@ app.post('/api/crm-test', async (req, res) => {
       const totalContacts = result.meta?.total || result.contacts?.length || 0;
       res.json({ success: true, totalContacts });
     } else {
+      // Return the EXACT error from the CRM API
       let errMsg = `HTTP ${response.status}`;
       let rawBody = '';
       try {
@@ -696,7 +810,7 @@ app.post('/api/crm-test', async (req, res) => {
   }
 });
 
-// Manual sync endpoint
+// Manual sync endpoint (called by Admin "Sync Now" button)
 app.post('/api/crm-sync', async (req, res) => {
   try {
     const { crmConfig, supabaseConfig } = req.body;
@@ -717,14 +831,15 @@ app.post('/api/crm-sync', async (req, res) => {
 });
 
 // ============================================================
-// Daily Cron Job
+// Daily Cron Job — runs at 3:00 AM server time
 // ============================================================
 
-const CRON_SCHEDULE = process.env.CRM_SYNC_CRON || '0 3 * * *';
+const CRON_SCHEDULE = process.env.CRM_SYNC_CRON || '0 3 * * *'; // default: 3 AM daily
 
 cron.schedule(CRON_SCHEDULE, async () => {
   console.log(`[${new Date().toISOString()}] Daily CRM sync cron triggered`);
 
+  // The cron needs the CRM + Supabase config. These come from environment variables.
   const crmConfig = {
     apiBase: process.env.CRM_API_BASE,
     apiKey: process.env.CRM_API_KEY,
@@ -741,7 +856,7 @@ cron.schedule(CRON_SCHEDULE, async () => {
   };
 
   if (!crmConfig.apiBase || !crmConfig.apiKey || !crmConfig.locationId) {
-    console.warn('Cron sync skipped: CRM env vars not set');
+    console.warn('Cron sync skipped: CRM env vars not set (CRM_API_BASE, CRM_API_KEY, CRM_LOCATION_ID)');
     return;
   }
 
@@ -763,4 +878,3 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
