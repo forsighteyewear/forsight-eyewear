@@ -738,7 +738,7 @@ app.post('/api/crm-documents/list', async (req, res) => {
       debugInfo.push(`Documents endpoint error: ${e.message}`);
     }
 
-    // Approach 2: Fetch the contact and look for file/document URLs in ALL custom fields
+    // Approach 2: Fetch the contact and look for file/document URLs in ALL custom fields & contact properties
     try {
       const contactUrl = `${crmConfig.apiBase}/contacts/${contactId}`;
       console.log(`[CRM Documents] Fetching contact: ${contactUrl}`);
@@ -757,55 +757,90 @@ app.post('/api/crm-documents/list', async (req, res) => {
         const customFields = contact.customFields || contact.custom_fields || contact.customField || [];
         console.log(`[CRM Documents] Contact has ${customFields.length} custom fields`);
 
-        // Check ALL custom fields for any URL that looks like a file
-        customFields.forEach((f) => {
-          const value = f.value || f.fieldValue || '';
-          const fieldName = (f.name || f.fieldName || f.key || '').toLowerCase();
-          if (value && typeof value === 'string' && value.startsWith('http')) {
-            // Check if it's a file URL (has a file extension or contains upload/file/doc in the URL or field name)
-            const looksLikeFile = value.match(/\.(pdf|jpg|jpeg|png|gif|doc|docx|tiff?|webp|heic)$/i) ||
-              fieldName.includes('doc') || fieldName.includes('file') || fieldName.includes('upload') ||
-              fieldName.includes('prescription') || fieldName.includes('image') || fieldName.includes('attachment') ||
-              fieldName.includes('scan') || fieldName.includes('photo') || fieldName.includes('insurance') ||
-              value.includes('storage.googleapis.com') || value.includes('amazonaws.com') ||
-              value.includes('cloudinary') || value.includes('upload') || value.includes('/files/');
-            if (looksLikeFile) {
-              documents.push({
-                id: f.id || `field-${documents.length}`,
-                fileName: value.split('/').pop()?.split('?')[0] || f.name || 'Document',
-                fileType: value.match(/\.(pdf)$/i) ? 'application/pdf' :
-                  value.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' :
-                  value.match(/\.(png)$/i) ? 'image/png' :
-                  value.match(/\.(gif)$/i) ? 'image/gif' :
-                  value.match(/\.(tiff?)$/i) ? 'image/tiff' :
-                  value.match(/\.(webp)$/i) ? 'image/webp' :
-                  'application/octet-stream',
-                fileSize: 0,
-                uploadedAt: contact.dateAdded || contact.dateUpdated || new Date().toISOString(),
-                category: f.name || 'CRM Custom Field',
-                url: value,
-                source: 'crm',
-              });
+        // Helper to extract URLs from any value (string, array, object, JSON)
+        const extractUrls = (val) => {
+          if (!val) return [];
+          if (typeof val === 'string') {
+            if (val.trim().startsWith('[') || val.trim().startsWith('{')) {
+              try {
+                const parsed = JSON.parse(val);
+                return extractUrls(parsed);
+              } catch (_) {}
             }
+            const found = val.match(/https?:\/\/[^\s"',<>\]\)]+/gi) || [];
+            return found;
           }
-        });
-        debugInfo.push(`Custom fields: found ${documents.length} file URLs`);
+          if (Array.isArray(val)) {
+            return val.flatMap(extractUrls);
+          }
+          if (typeof val === 'object') {
+            return Object.values(val).flatMap(extractUrls);
+          }
+          return [];
+        };
 
-        // Also check contact notes for file URLs
-        const notes = contact.notes || '';
-        if (notes) {
-          const urlRegex = /https?:\/\/[^\s"'<>]+\.(pdf|jpg|jpeg|png|gif|tiff?|webp|docx?)/gi;
-          const noteUrls = notes.match(urlRegex) || [];
-          noteUrls.forEach((url, idx) => {
-            // Avoid duplicates
+        // Check ALL custom fields for any URL
+        customFields.forEach((f) => {
+          const fieldName = (f.name || f.fieldName || f.key || 'Custom Field').trim();
+          const rawVal = f.value ?? f.fieldValue ?? f.values ?? '';
+          const urls = extractUrls(rawVal);
+
+          urls.forEach((url, uIdx) => {
             if (!documents.find(d => d.url === url)) {
+              const cleanFileName = url.split('/').pop()?.split('?')[0] || `${fieldName} File`;
               documents.push({
-                id: `note-${idx}`,
-                fileName: url.split('/').pop()?.split('?')[0] || 'Note Document',
+                id: f.id ? `${f.id}-${uIdx}` : `field-${documents.length}`,
+                fileName: cleanFileName.length > 50 ? cleanFileName.substring(0, 47) + '...' : cleanFileName,
                 fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' :
                   url.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' :
                   url.match(/\.(png)$/i) ? 'image/png' :
+                  url.match(/\.(gif)$/i) ? 'image/gif' :
+                  url.match(/\.(tiff?)$/i) ? 'image/tiff' :
+                  url.match(/\.(webp)$/i) ? 'image/webp' :
                   'application/octet-stream',
+                fileSize: 0,
+                uploadedAt: contact.dateAdded || contact.dateUpdated || new Date().toISOString(),
+                category: fieldName || 'CRM Field File',
+                url,
+                source: 'crm',
+              });
+            }
+          });
+        });
+        debugInfo.push(`Custom fields scanned: found ${documents.length} document links`);
+
+        // Check contact top-level object for any file/attachment properties
+        const topLevelUrls = extractUrls({
+          attachments: contact.attachments,
+          files: contact.files,
+          documents: contact.documents,
+          customField: contact.customField,
+        });
+        topLevelUrls.forEach((url, idx) => {
+          if (!documents.find(d => d.url === url)) {
+            documents.push({
+              id: `top-file-${idx}`,
+              fileName: url.split('/').pop()?.split('?')[0] || 'Contact Attachment',
+              fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
+              fileSize: 0,
+              uploadedAt: contact.dateAdded || new Date().toISOString(),
+              category: 'Contact Attachment',
+              url,
+              source: 'crm',
+            });
+          }
+        });
+
+        // Also check contact inline notes
+        const notes = contact.notes || '';
+        if (notes) {
+          const noteUrls = extractUrls(notes);
+          noteUrls.forEach((url, idx) => {
+            if (!documents.find(d => d.url === url)) {
+              documents.push({
+                id: `note-inline-${idx}`,
+                fileName: url.split('/').pop()?.split('?')[0] || 'Note Document',
+                fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
                 fileSize: 0,
                 uploadedAt: contact.dateAdded || new Date().toISOString(),
                 category: 'From Notes',
@@ -814,7 +849,6 @@ app.post('/api/crm-documents/list', async (req, res) => {
               });
             }
           });
-          if (noteUrls.length) debugInfo.push(`Notes: found ${noteUrls.length} file URLs`);
         }
       } else {
         debugInfo.push(`Contact endpoint returned ${contactRes.status}`);
@@ -823,11 +857,10 @@ app.post('/api/crm-documents/list', async (req, res) => {
       debugInfo.push(`Contact fetch error: ${e.message}`);
     }
 
-    // Approach 3: Try searching for files via the CRM's file/document search endpoint
+    // Approach 3: Fetch contact notes endpoint (/contacts/{contactId}/notes)
     try {
-      const fileSearchUrl = `${crmConfig.apiBase}/files/search?contactId=${contactId}&limit=100`;
-      console.log(`[CRM Documents] Trying file search: ${fileSearchUrl}`);
-      const fileRes = await fetch(fileSearchUrl, {
+      const notesUrl = `${crmConfig.apiBase}/contacts/${contactId}/notes`;
+      const notesRes = await fetch(notesUrl, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${crmConfig.apiKey}`,
@@ -835,30 +868,35 @@ app.post('/api/crm-documents/list', async (req, res) => {
           'Version': '2021-07-28',
         },
       });
-      if (fileRes.ok) {
-        const fileData = await fileRes.json();
-        const files = fileData.files || fileData.data || fileData.items || [];
-        console.log(`[CRM Documents] File search found ${files.length} files`);
-        files.forEach((f) => {
-          if (!documents.find(d => d.url === (f.url || f.downloadUrl))) {
-            documents.push({
-              id: f.id || `file-${documents.length}`,
-              fileName: f.name || f.fileName || 'File',
-              fileType: f.mimeType || f.contentType || 'application/octet-stream',
-              fileSize: f.size || 0,
-              uploadedAt: f.uploadedAt || f.createdAt || new Date().toISOString(),
-              category: 'CRM File',
-              url: f.url || f.downloadUrl || '',
-              source: 'crm',
-            });
-          }
+      if (notesRes.ok) {
+        const notesData = await notesRes.json();
+        const notesList = notesData.notes || notesData.data || (Array.isArray(notesData) ? notesData : []);
+        let notesDocCount = 0;
+        notesList.forEach((n, nIdx) => {
+          const body = n.body || n.note || n.text || '';
+          const matches = body.match(/https?:\/\/[^\s"',<>\]\)]+/gi) || [];
+          matches.forEach((url, uIdx) => {
+            if (!documents.find(d => d.url === url)) {
+              notesDocCount++;
+              documents.push({
+                id: n.id ? `${n.id}-${uIdx}` : `note-ep-${nIdx}-${uIdx}`,
+                fileName: url.split('/').pop()?.split('?')[0] || 'Note Attachment',
+                fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
+                fileSize: 0,
+                uploadedAt: n.dateAdded || n.createdAt || new Date().toISOString(),
+                category: 'Note Attachment',
+                url,
+                source: 'crm',
+              });
+            }
+          });
         });
-        debugInfo.push(`File search: found ${files.length} files`);
+        debugInfo.push(`Notes endpoint scanned: found ${notesDocCount} files`);
       } else {
-        debugInfo.push(`File search returned ${fileRes.status}`);
+        debugInfo.push(`Notes endpoint status: ${notesRes.status}`);
       }
     } catch (e) {
-      debugInfo.push(`File search error: ${e.message}`);
+      debugInfo.push(`Notes endpoint error: ${e.message}`);
     }
 
     console.log(`[CRM Documents] Total documents found: ${documents.length}`);
