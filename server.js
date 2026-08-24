@@ -810,6 +810,80 @@ app.post('/api/crm-test', async (req, res) => {
   }
 });
 
+// CRM Contact Search — search contacts directly from the CRM
+app.post('/api/crm-search-contacts', async (req, res) => {
+  try {
+    const { crmConfig, query } = req.body;
+    if (!crmConfig || !crmConfig.apiBase || !crmConfig.apiKey || !crmConfig.locationId) {
+      return res.status(400).json({ message: 'CRM config is incomplete.' });
+    }
+    if (!query || query.trim().length < 2) {
+      return res.json({ success: true, contacts: [] });
+    }
+
+    const q = query.trim();
+    let allContacts = [];
+    let fetchUrl = `${crmConfig.apiBase}/contacts/?locationId=${crmConfig.locationId}&limit=100`;
+
+    while (fetchUrl && allContacts.length < 500) {
+      const response = await fetch(fetchUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${crmConfig.apiKey}`,
+          'Content-Type': 'application/json',
+          'Version': '2021-07-28',
+        },
+      });
+
+      if (!response.ok) {
+        const errText = await response.text();
+        return res.status(response.status).json({ message: `CRM API Error: ${response.status} - ${errText}` });
+      }
+
+      const result = await response.json();
+      const contacts = result.contacts || [];
+      allContacts = [...allContacts, ...contacts];
+
+      if (result.meta && result.meta.nextPageUrl) {
+        const nextUrl = result.meta.nextPageUrl;
+        if (nextUrl.startsWith('http')) {
+          fetchUrl = nextUrl;
+        } else if (nextUrl.startsWith('/')) {
+          fetchUrl = `${crmConfig.apiBase}${nextUrl}`;
+        } else if (nextUrl.startsWith('?')) {
+          const baseUrl = fetchUrl.split('?')[0];
+          fetchUrl = `${baseUrl}${nextUrl}`;
+        } else {
+          fetchUrl = `${crmConfig.apiBase}/${nextUrl}`;
+        }
+      } else {
+        fetchUrl = "";
+      }
+    }
+
+    const qLower = q.toLowerCase();
+    const filtered = allContacts
+      .filter((c) => {
+        const fullName = `${c.firstName || ''} ${c.lastName || ''}`.toLowerCase();
+        const email = (c.email || '').toLowerCase();
+        const phone = (c.phone || '').toLowerCase();
+        return fullName.includes(qLower) || email.includes(qLower) || phone.includes(qLower);
+      })
+      .slice(0, 50)
+      .map((c) => ({
+        id: c.id,
+        name: `${c.firstName || ''} ${c.lastName || ''}`.trim() || 'Unknown',
+        email: c.email || '',
+        phone: c.phone || '',
+      }));
+
+    res.json({ success: true, contacts: filtered });
+  } catch (error) {
+    console.error('CRM Contact Search Error:', error.message);
+    res.status(500).json({ message: error.message || 'Search failed' });
+  }
+});
+
 // Manual sync endpoint (called by Admin "Sync Now" button)
 app.post('/api/crm-sync', async (req, res) => {
   try {
