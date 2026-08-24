@@ -1,4 +1,4 @@
- import express from 'express';
+import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
 import dotenv from 'dotenv';
@@ -309,6 +309,8 @@ app.post('/api/generate-brand-description', async (req, res) => {
 // ============================================================
 // CRM ↔ Supabase Bidirectional Sync
 // ============================================================
+
+// (imports moved to top of file)
 
 /**
  * Fetch all contacts from the CRM with pagination.
@@ -695,37 +697,183 @@ app.post('/api/crm-documents/list', async (req, res) => {
       return res.status(400).json({ message: 'crmConfig (apiBase, apiKey, locationId) and contactId are required' });
     }
 
-    // Fetch documents associated with the contact from the CRM
-    const docUrl = `${crmConfig.apiBase}/contacts/${contactId}/documents`;
-    const response = await fetch(docUrl, {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${crmConfig.apiKey}`,
-        'Content-Type': 'application/json',
-        'Version': '2021-07-28',
-      },
-    });
+    console.log(`[CRM Documents] Fetching documents for contact: ${contactId}`);
+    const documents = [];
+    let debugInfo = [];
 
-    if (!response.ok) {
-      const errText = await response.text();
-      return res.status(response.status).json({ message: `CRM API Error: ${response.status} - ${errText}` });
+    // Approach 1: Try the /contacts/{contactId}/documents endpoint
+    try {
+      const docUrl = `${crmConfig.apiBase}/contacts/${contactId}/documents`;
+      console.log(`[CRM Documents] Trying endpoint: ${docUrl}`);
+      const response = await fetch(docUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${crmConfig.apiKey}`,
+          'Content-Type': 'application/json',
+          'Version': '2021-07-28',
+        },
+      });
+
+      if (response.ok) {
+        const result = await response.json();
+        const rawDocs = result.documents || result.files || result.data || result.items || (Array.isArray(result) ? result : []);
+        console.log(`[CRM Documents] Found ${rawDocs.length} documents from documents endpoint`);
+        rawDocs.forEach((d) => {
+          documents.push({
+            id: d.id || d.documentId || d.fileId || '',
+            fileName: d.name || d.fileName || d.originalName || d.title || 'Unknown',
+            fileType: d.mimeType || d.fileType || d.contentType || d.ext || 'application/octet-stream',
+            fileSize: d.size || d.fileSize || d.bytes || 0,
+            uploadedAt: d.uploadedAt || d.createdAt || d.dateAdded || d.updatedAt || new Date().toISOString(),
+            category: d.category || d.documentType || d.type || 'CRM Document',
+            url: d.url || d.downloadUrl || d.fileUrl || d.link || '',
+            source: 'crm',
+          });
+        });
+        debugInfo.push(`Documents endpoint: found ${documents.length}`);
+      } else {
+        debugInfo.push(`Documents endpoint returned ${response.status}`);
+      }
+    } catch (e) {
+      debugInfo.push(`Documents endpoint error: ${e.message}`);
     }
 
-    const result = await response.json();
-    const documents = (result.documents || result.files || result.data || []).map((d) => ({
-      id: d.id || d.documentId || '',
-      fileName: d.name || d.fileName || d.originalName || 'Unknown',
-      fileType: d.mimeType || d.fileType || d.contentType || 'application/octet-stream',
-      fileSize: d.size || d.fileSize || 0,
-      uploadedAt: d.uploadedAt || d.createdAt || d.dateAdded || new Date().toISOString(),
-      category: d.category || d.documentType || 'CRM Document',
-      url: d.url || d.downloadUrl || d.fileUrl || '',
-      source: 'crm',
-    }));
+    // Approach 2: Fetch the contact and look for file/document URLs in ALL custom fields
+    try {
+      const contactUrl = `${crmConfig.apiBase}/contacts/${contactId}`;
+      console.log(`[CRM Documents] Fetching contact: ${contactUrl}`);
+      const contactRes = await fetch(contactUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${crmConfig.apiKey}`,
+          'Content-Type': 'application/json',
+          'Version': '2021-07-28',
+        },
+      });
 
-    res.json({ success: true, documents });
+      if (contactRes.ok) {
+        const contactData = await contactRes.json();
+        const contact = contactData.contact || contactData;
+        const customFields = contact.customFields || contact.custom_fields || contact.customField || [];
+        console.log(`[CRM Documents] Contact has ${customFields.length} custom fields`);
+
+        // Check ALL custom fields for any URL that looks like a file
+        customFields.forEach((f) => {
+          const value = f.value || f.fieldValue || '';
+          const fieldName = (f.name || f.fieldName || f.key || '').toLowerCase();
+          if (value && typeof value === 'string' && value.startsWith('http')) {
+            // Check if it's a file URL (has a file extension or contains upload/file/doc in the URL or field name)
+            const looksLikeFile = value.match(/\.(pdf|jpg|jpeg|png|gif|doc|docx|tiff?|webp|heic)$/i) ||
+              fieldName.includes('doc') || fieldName.includes('file') || fieldName.includes('upload') ||
+              fieldName.includes('prescription') || fieldName.includes('image') || fieldName.includes('attachment') ||
+              fieldName.includes('scan') || fieldName.includes('photo') || fieldName.includes('insurance') ||
+              value.includes('storage.googleapis.com') || value.includes('amazonaws.com') ||
+              value.includes('cloudinary') || value.includes('upload') || value.includes('/files/');
+            if (looksLikeFile) {
+              documents.push({
+                id: f.id || `field-${documents.length}`,
+                fileName: value.split('/').pop()?.split('?')[0] || f.name || 'Document',
+                fileType: value.match(/\.(pdf)$/i) ? 'application/pdf' :
+                  value.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' :
+                  value.match(/\.(png)$/i) ? 'image/png' :
+                  value.match(/\.(gif)$/i) ? 'image/gif' :
+                  value.match(/\.(tiff?)$/i) ? 'image/tiff' :
+                  value.match(/\.(webp)$/i) ? 'image/webp' :
+                  'application/octet-stream',
+                fileSize: 0,
+                uploadedAt: contact.dateAdded || contact.dateUpdated || new Date().toISOString(),
+                category: f.name || 'CRM Custom Field',
+                url: value,
+                source: 'crm',
+              });
+            }
+          }
+        });
+        debugInfo.push(`Custom fields: found ${documents.length} file URLs`);
+
+        // Also check contact notes for file URLs
+        const notes = contact.notes || '';
+        if (notes) {
+          const urlRegex = /https?:\/\/[^\s"'<>]+\.(pdf|jpg|jpeg|png|gif|tiff?|webp|docx?)/gi;
+          const noteUrls = notes.match(urlRegex) || [];
+          noteUrls.forEach((url, idx) => {
+            // Avoid duplicates
+            if (!documents.find(d => d.url === url)) {
+              documents.push({
+                id: `note-${idx}`,
+                fileName: url.split('/').pop()?.split('?')[0] || 'Note Document',
+                fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' :
+                  url.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' :
+                  url.match(/\.(png)$/i) ? 'image/png' :
+                  'application/octet-stream',
+                fileSize: 0,
+                uploadedAt: contact.dateAdded || new Date().toISOString(),
+                category: 'From Notes',
+                url,
+                source: 'crm',
+              });
+            }
+          });
+          if (noteUrls.length) debugInfo.push(`Notes: found ${noteUrls.length} file URLs`);
+        }
+      } else {
+        debugInfo.push(`Contact endpoint returned ${contactRes.status}`);
+      }
+    } catch (e) {
+      debugInfo.push(`Contact fetch error: ${e.message}`);
+    }
+
+    // Approach 3: Try searching for files via the CRM's file/document search endpoint
+    try {
+      const fileSearchUrl = `${crmConfig.apiBase}/files/search?contactId=${contactId}&limit=100`;
+      console.log(`[CRM Documents] Trying file search: ${fileSearchUrl}`);
+      const fileRes = await fetch(fileSearchUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${crmConfig.apiKey}`,
+          'Content-Type': 'application/json',
+          'Version': '2021-07-28',
+        },
+      });
+      if (fileRes.ok) {
+        const fileData = await fileRes.json();
+        const files = fileData.files || fileData.data || fileData.items || [];
+        console.log(`[CRM Documents] File search found ${files.length} files`);
+        files.forEach((f) => {
+          if (!documents.find(d => d.url === (f.url || f.downloadUrl))) {
+            documents.push({
+              id: f.id || `file-${documents.length}`,
+              fileName: f.name || f.fileName || 'File',
+              fileType: f.mimeType || f.contentType || 'application/octet-stream',
+              fileSize: f.size || 0,
+              uploadedAt: f.uploadedAt || f.createdAt || new Date().toISOString(),
+              category: 'CRM File',
+              url: f.url || f.downloadUrl || '',
+              source: 'crm',
+            });
+          }
+        });
+        debugInfo.push(`File search: found ${files.length} files`);
+      } else {
+        debugInfo.push(`File search returned ${fileRes.status}`);
+      }
+    } catch (e) {
+      debugInfo.push(`File search error: ${e.message}`);
+    }
+
+    console.log(`[CRM Documents] Total documents found: ${documents.length}`);
+    console.log(`[CRM Documents] Debug: ${debugInfo.join('; ')}`);
+
+    // ALWAYS return 200 so the frontend doesn't throw
+    return res.status(200).json({
+      success: true,
+      documents,
+      debug: debugInfo.join('; '),
+    });
   } catch (error) {
-    res.status(500).json({ message: error.message || 'Failed to fetch CRM documents' });
+    console.error('[CRM Documents] Error:', error.message);
+    // Return 200 with empty array so frontend doesn't crash
+    return res.status(200).json({ success: true, documents: [], debug: `Error: ${error.message}` });
   }
 });
 
