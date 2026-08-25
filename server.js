@@ -1,3 +1,4 @@
+```js
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
@@ -10,7 +11,8 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const GA4_SERVICE_ACCOUNT_EMAIL = process.env.GA4_SERVICE_ACCOUNT_EMAIL;
@@ -779,11 +781,21 @@ app.post('/api/crm-documents/list', async (req, res) => {
           return [];
         };
 
-        // Check ALL custom fields for any URL
+        // Check ALL custom fields for any URL or file path/value
         customFields.forEach((f) => {
           const fieldName = (f.name || f.fieldName || f.key || 'Custom Field').trim();
-          const rawVal = f.value ?? f.fieldValue ?? f.values ?? '';
+          const rawVal = f.value ?? f.fieldValue ?? f.values ?? f.valueArray ?? '';
           const urls = extractUrls(rawVal);
+
+          // If rawVal is an array of file objects or strings
+          if (Array.isArray(rawVal)) {
+            rawVal.forEach((item) => {
+              const itemUrl = typeof item === 'string' ? item : item.url || item.fileUrl || item.link;
+              if (itemUrl && typeof itemUrl === 'string' && itemUrl.startsWith('http')) {
+                urls.push(itemUrl);
+              }
+            });
+          }
 
           urls.forEach((url, uIdx) => {
             if (!documents.find(d => d.url === url)) {
@@ -899,6 +911,97 @@ app.post('/api/crm-documents/list', async (req, res) => {
       debugInfo.push(`Notes endpoint error: ${e.message}`);
     }
 
+    // Approach 4: Fetch conversations for this contact and look for file attachments
+    try {
+      const convoUrl = `${crmConfig.apiBase}/conversations?locationId=${crmConfig.locationId}&contactId=${contactId}&limit=50`;
+      console.log(`[CRM Documents] Trying conversations: ${convoUrl}`);
+      const convoRes = await fetch(convoUrl, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${crmConfig.apiKey}`,
+          'Content-Type': 'application/json',
+          'Version': '2021-07-28',
+        },
+      });
+      if (convoRes.ok) {
+        const convoData = await convoRes.json();
+        const conversations = convoData.conversations || convoData.data || [];
+        console.log(`[CRM Documents] Found ${conversations.length} conversations`);
+        let convoDocCount = 0;
+
+        for (const convo of conversations) {
+          const convoId = convo.id || convo.conversationId;
+          if (!convoId) continue;
+
+          // Fetch messages in this conversation
+          try {
+            const msgUrl = `${crmConfig.apiBase}/conversations/${convoId}/messages?limit=100`;
+            const msgRes = await fetch(msgUrl, {
+              method: 'GET',
+              headers: {
+                'Authorization': `Bearer ${crmConfig.apiKey}`,
+                'Content-Type': 'application/json',
+                'Version': '2021-07-28',
+              },
+            });
+            if (msgRes.ok) {
+              const msgData = await msgRes.json();
+              const messages = msgData.messages || msgData.data || [];
+              for (const msg of messages) {
+                // Check for attachments in the message
+                const attachments = msg.attachments || msg.files || msg.media || [];
+                if (Array.isArray(attachments)) {
+                  for (const att of attachments) {
+                    const attUrl = att.url || att.link || att.fileUrl || (typeof att === 'string' ? att : '');
+                    if (attUrl && !documents.find(d => d.url === attUrl)) {
+                      convoDocCount++;
+                      documents.push({
+                        id: att.id || `convo-${convoId}-${documents.length}`,
+                        fileName: att.name || att.fileName || attUrl.split('/').pop()?.split('?')[0] || 'Conversation Attachment',
+                        fileType: att.mimeType || att.contentType || (attUrl.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg'),
+                        fileSize: att.size || 0,
+                        uploadedAt: msg.dateAdded || msg.createdAt || new Date().toISOString(),
+                        category: 'Conversation Attachment',
+                        url: attUrl,
+                        source: 'crm',
+                      });
+                    }
+                  }
+                }
+                // Also check message body for file URLs
+                const body = msg.body || msg.message || msg.text || '';
+                if (body) {
+                  const bodyUrls = body.match(/https?:\/\/[^\s"',<>\]\)]+/gi) || [];
+                  for (const url of bodyUrls) {
+                    if (url.match(/\.(pdf|jpg|jpeg|png|gif|tiff?|webp|docx?|heic)$/i) && !documents.find(d => d.url === url)) {
+                      convoDocCount++;
+                      documents.push({
+                        id: `msg-${msg.id || documents.length}`,
+                        fileName: url.split('/').pop()?.split('?')[0] || 'Message File',
+                        fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
+                        fileSize: 0,
+                        uploadedAt: msg.dateAdded || new Date().toISOString(),
+                        category: 'Message File',
+                        url,
+                        source: 'crm',
+                      });
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            // skip individual message fetch errors
+          }
+        }
+        debugInfo.push(`Conversations scanned: found ${convoDocCount} files`);
+      } else {
+        debugInfo.push(`Conversations endpoint returned ${convoRes.status}`);
+      }
+    } catch (e) {
+      debugInfo.push(`Conversations error: ${e.message}`);
+    }
+
     console.log(`[CRM Documents] Total documents found: ${documents.length}`);
     console.log(`[CRM Documents] Debug: ${debugInfo.join('; ')}`);
 
@@ -912,6 +1015,150 @@ app.post('/api/crm-documents/list', async (req, res) => {
     console.error('[CRM Documents] Error:', error.message);
     // Return 200 with empty array so frontend doesn't crash
     return res.status(200).json({ success: true, documents: [], debug: `Error: ${error.message}` });
+  }
+});
+
+// Endpoint to upload a file directly to CRM custom file fields or attachments
+app.post('/api/crm-upload-custom-file', async (req, res) => {
+  try {
+    const { crmConfig, contactId, fileData, fileName, fileType, fieldId } = req.body;
+    if (!crmConfig?.apiBase || !crmConfig?.apiKey || !contactId || !fileData) {
+      return res.status(400).json({ message: 'crmConfig, contactId, and fileData (base64 or URL) are required' });
+    }
+
+    // Use native FormData & Blob (Node 18+ globals). node-fetch v3 does NOT export these.
+    const NativeFormData = globalThis.FormData;
+    const NativeBlob = globalThis.Blob;
+
+    // 1. Try forms/upload-custom-files endpoint if fieldId is provided
+    if (fieldId && NativeFormData && NativeBlob) {
+      try {
+        const uploadUrl = `https://services.leadconnectorhq.com/forms/upload-custom-files?contactId=${contactId}&locationId=${crmConfig.locationId}`;
+        const formData = new NativeFormData();
+
+        let fileBuffer;
+        if (fileData.startsWith('data:')) {
+          const base64Content = fileData.split(',')[1];
+          fileBuffer = Buffer.from(base64Content, 'base64');
+        } else if (fileData.startsWith('http')) {
+          const fetched = await fetch(fileData);
+          // node-fetch v3 uses arrayBuffer(), not buffer()
+          const ab = await fetched.arrayBuffer();
+          fileBuffer = Buffer.from(ab);
+        } else {
+          fileBuffer = Buffer.from(fileData, 'base64');
+        }
+
+        const blob = new NativeBlob([fileBuffer], { type: fileType || 'application/octet-stream' });
+        formData.append(fieldId, blob, fileName || 'document.pdf');
+
+        const uploadRes = await fetch(uploadUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${crmConfig.apiKey}`,
+            'Accept': 'application/json',
+            'Version': '2021-07-28',
+          },
+          body: formData,
+        });
+
+        if (uploadRes.ok) {
+          const uploadJson = await uploadRes.json();
+          console.log('[CRM Upload Custom File] Success via upload-custom-files:', uploadJson);
+
+          // The upload returns the hosted file URL(s). Set it onto the contact's
+          // custom field so it appears in the CRM document vault / custom field.
+          let fileUrl = null;
+          if (uploadJson?.fileUrl) {
+            fileUrl = uploadJson.fileUrl;
+          } else if (uploadJson?.url) {
+            fileUrl = uploadJson.url;
+          } else if (Array.isArray(uploadJson?.files) && uploadJson.files.length > 0) {
+            fileUrl = uploadJson.files[0]?.url || uploadJson.files[0];
+          } else if (Array.isArray(uploadJson?.uploadedFiles) && uploadJson.uploadedFiles.length > 0) {
+            fileUrl = uploadJson.uploadedFiles[0]?.url || uploadJson.uploadedFiles[0];
+          }
+
+          if (fileUrl && typeof fileUrl === 'string') {
+            try {
+              await fetch(`${crmConfig.apiBase}/contacts/${contactId}`, {
+                method: 'PUT',
+                headers: {
+                  'Authorization': `Bearer ${crmConfig.apiKey}`,
+                  'Content-Type': 'application/json',
+                  'Version': '2021-07-28',
+                },
+                body: JSON.stringify({
+                  customFields: [{ id: fieldId, field_value: fileUrl }],
+                }),
+              });
+              console.log('[CRM Upload Custom File] Set file URL on custom field:', fieldId);
+            } catch (setErr) {
+              console.warn('[CRM Upload Custom File] Could not set custom field value:', setErr.message);
+            }
+          }
+
+          return res.json({ success: true, method: 'upload-custom-files', data: uploadJson, fileUrl });
+        } else {
+          const errText = await uploadRes.text();
+          console.warn('[CRM Upload Custom File] upload-custom-files returned status:', uploadRes.status, errText);
+        }
+      } catch (err) {
+        console.warn('[CRM Upload Custom File] Error during upload-custom-files:', err.message);
+      }
+    }
+
+    // 2. Fallback: Always attach a note with the document link so it registers under contact activity & notes
+    const publicUrl = fileData.startsWith('http') ? fileData : null;
+    if (publicUrl) {
+      const noteRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}/notes`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${crmConfig.apiKey}`,
+          'Content-Type': 'application/json',
+          'Version': '2021-07-28',
+        },
+        body: JSON.stringify({ body: `[Document Uploaded] ${fileName || 'File'}: ${publicUrl}` }),
+      });
+      if (noteRes.ok) {
+        return res.json({ success: true, method: 'note' });
+      }
+    }
+
+    return res.json({ success: true, method: 'logged' });
+  } catch (error) {
+    console.error('[CRM Upload Custom File] Exception:', error);
+    return res.status(500).json({ message: error.message });
+  }
+});
+
+// Endpoint to add a note to a CRM contact (logs uploaded document URL directly into contact notes)
+app.post('/api/crm-contact-add-note', async (req, res) => {
+  try {
+    const { crmConfig, contactId, note } = req.body;
+    if (!crmConfig?.apiBase || !crmConfig?.apiKey || !contactId || !note) {
+      return res.status(400).json({ message: 'crmConfig, contactId, and note are required' });
+    }
+
+    const noteRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}/notes`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${crmConfig.apiKey}`,
+        'Content-Type': 'application/json',
+        'Version': '2021-07-28',
+      },
+      body: JSON.stringify({ body: note }),
+    });
+
+    if (!noteRes.ok) {
+      const errText = await noteRes.text();
+      return res.status(noteRes.status).json({ message: `Failed to add note: ${errText}` });
+    }
+
+    const result = await noteRes.json();
+    return res.json({ success: true, note: result });
+  } catch (error) {
+    return res.status(500).json({ message: error.message });
   }
 });
 
@@ -952,6 +1199,54 @@ app.post('/api/send-referral-sms', async (req, res) => {
   } catch (error) {
     console.error('Referral SMS Error:', error.message);
     res.status(500).json({ message: error.message || 'Failed to send SMS' });
+  }
+});
+
+// Debug endpoint — dumps raw contact data to see what fields/attachments exist
+app.post('/api/crm-contact-debug', async (req, res) => {
+  try {
+    const { crmConfig, contactId } = req.body;
+    if (!crmConfig?.apiBase || !crmConfig?.apiKey || !contactId) {
+      return res.status(400).json({ message: 'crmConfig and contactId required' });
+    }
+
+    const contactRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${crmConfig.apiKey}`,
+        'Content-Type': 'application/json',
+        'Version': '2021-07-28',
+      },
+    });
+
+    const contactText = await contactRes.text();
+    let contactJson;
+    try { contactJson = JSON.parse(contactText); } catch (_) { contactJson = { raw: contactText }; }
+
+    // Also try conversations listing
+    let conversations = null;
+    try {
+      const convoRes = await fetch(`${crmConfig.apiBase}/conversations?locationId=${crmConfig.locationId}&contactId=${contactId}&limit=10`, {
+        method: 'GET',
+        headers: {
+          'Authorization': `Bearer ${crmConfig.apiKey}`,
+          'Content-Type': 'application/json',
+          'Version': '2021-07-28',
+        },
+      });
+      conversations = await convoRes.json();
+    } catch (e) {
+      conversations = { error: e.message };
+    }
+
+    return res.status(200).json({
+      contactStatus: contactRes.status,
+      contactKeys: contactJson?.contact ? Object.keys(contactJson.contact) : Object.keys(contactJson),
+      customFields: contactJson?.contact?.customFields || contactJson?.customFields || [],
+      conversations: conversations,
+    });
+  } catch (error) {
+    return res.status(200).json({ error: error.message });
   }
 });
 
@@ -1138,3 +1433,4 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
+```
