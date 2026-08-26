@@ -1,4 +1,3 @@
-```js
 import express from 'express';
 import cors from 'cors';
 import fetch from 'node-fetch';
@@ -220,7 +219,7 @@ app.post('/api/generate-special', async (req, res) => {
     const generatedText = result.choices[0].message.content.trim();
     res.json({ description: generatedText });
   } catch (error) {
-    console.error("AI Generation Error:", error);
+    console.error('AI Generation Error:', error);
     res.status(500).json({ message: error.message || "Internal server error" });
   }
 });
@@ -261,7 +260,7 @@ app.post('/api/generate-blog', async (req, res) => {
     const generatedText = result.choices[0].message.content.trim();
     res.json({ content: generatedText });
   } catch (error) {
-    console.error("AI Generation Error:", error);
+    console.error('AI Generation Error:', error);
     res.status(500).json({ message: error.message || "Internal server error" });
   }
 });
@@ -303,7 +302,7 @@ app.post('/api/generate-brand-description', async (req, res) => {
     const generatedText = result.output_text?.trim() || "Generated description.";
     res.json({ description: generatedText });
   } catch (error) {
-    console.error("AI Generation Error:", error);
+    console.error('AI Generation Error:', error);
     res.status(500).json({ message: error.message || "Internal server error" });
   }
 });
@@ -1050,7 +1049,15 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
         }
 
         const blob = new NativeBlob([fileBuffer], { type: fileType || 'application/octet-stream' });
-        formData.append(fieldId, blob, fileName || 'document.pdf');
+
+        // CRITICAL: CRM requires the multipart field key to be "<customFieldId>_<fileId>"
+        // where fileId is a randomly generated UUID. Appending just the fieldId is
+        // silently ignored by the API, which is why files never appeared in the CRM.
+        const fileId = crypto.randomUUID();
+        const fieldKey = `${fieldId}_${fileId}`;
+        formData.append(fieldKey, blob, fileName || 'document.pdf');
+
+        console.log(`[CRM Upload Custom File] Uploading to field key: ${fieldKey} (${fileType || 'unknown'})`);
 
         const uploadRes = await fetch(uploadUrl, {
           method: 'POST',
@@ -1062,70 +1069,57 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
           body: formData,
         });
 
+        const uploadText = await uploadRes.text();
+        let uploadJson = null;
+        try { uploadJson = JSON.parse(uploadText); } catch (_) { uploadJson = { raw: uploadText }; }
+
         if (uploadRes.ok) {
-          const uploadJson = await uploadRes.json();
-          console.log('[CRM Upload Custom File] Success via upload-custom-files:', uploadJson);
-
-          // The upload returns the hosted file URL(s). Set it onto the contact's
-          // custom field so it appears in the CRM document vault / custom field.
-          let fileUrl = null;
-          if (uploadJson?.fileUrl) {
-            fileUrl = uploadJson.fileUrl;
-          } else if (uploadJson?.url) {
-            fileUrl = uploadJson.url;
-          } else if (Array.isArray(uploadJson?.files) && uploadJson.files.length > 0) {
-            fileUrl = uploadJson.files[0]?.url || uploadJson.files[0];
-          } else if (Array.isArray(uploadJson?.uploadedFiles) && uploadJson.uploadedFiles.length > 0) {
-            fileUrl = uploadJson.uploadedFiles[0]?.url || uploadJson.uploadedFiles[0];
-          }
-
-          if (fileUrl && typeof fileUrl === 'string') {
-            try {
-              await fetch(`${crmConfig.apiBase}/contacts/${contactId}`, {
-                method: 'PUT',
-                headers: {
-                  'Authorization': `Bearer ${crmConfig.apiKey}`,
-                  'Content-Type': 'application/json',
-                  'Version': '2021-07-28',
-                },
-                body: JSON.stringify({
-                  customFields: [{ id: fieldId, field_value: fileUrl }],
-                }),
-              });
-              console.log('[CRM Upload Custom File] Set file URL on custom field:', fieldId);
-            } catch (setErr) {
-              console.warn('[CRM Upload Custom File] Could not set custom field value:', setErr.message);
-            }
-          }
-
-          return res.json({ success: true, method: 'upload-custom-files', data: uploadJson, fileUrl });
+          console.log('[CRM Upload Custom File] Success via upload-custom-files. Status:', uploadRes.status);
+          // The upload-custom-files endpoint returns the UPDATED CONTACT OBJECT —
+          // the file URL is already written onto the custom field automatically.
+          // No separate PUT is needed.
+          return res.json({ success: true, method: 'upload-custom-files', data: uploadJson });
         } else {
-          const errText = await uploadRes.text();
-          console.warn('[CRM Upload Custom File] upload-custom-files returned status:', uploadRes.status, errText);
+          console.warn('[CRM Upload Custom File] upload-custom-files returned status:', uploadRes.status, uploadText);
+          // Don't return yet — fall through to note fallback so the file is at least logged
         }
       } catch (err) {
         console.warn('[CRM Upload Custom File] Error during upload-custom-files:', err.message);
+        // Fall through to note fallback
       }
+    } else if (!fieldId) {
+      console.warn('[CRM Upload Custom File] No fieldId (Documents File Upload field) configured — skipping native vault upload.');
     }
 
     // 2. Fallback: Always attach a note with the document link so it registers under contact activity & notes
     const publicUrl = fileData.startsWith('http') ? fileData : null;
     if (publicUrl) {
-      const noteRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}/notes`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${crmConfig.apiKey}`,
-          'Content-Type': 'application/json',
-          'Version': '2021-07-28',
-        },
-        body: JSON.stringify({ body: `[Document Uploaded] ${fileName || 'File'}: ${publicUrl}` }),
-      });
-      if (noteRes.ok) {
-        return res.json({ success: true, method: 'note' });
+      try {
+        const noteRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}/notes`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${crmConfig.apiKey}`,
+            'Content-Type': 'application/json',
+            'Version': '2021-07-28',
+          },
+          body: JSON.stringify({ body: `[Document Uploaded] ${fileName || 'File'}: ${publicUrl}` }),
+        });
+        if (noteRes.ok) {
+          return res.json({ success: true, method: 'note', note: 'File logged to contact notes (native vault upload unavailable).' });
+        } else {
+          const noteErr = await noteRes.text();
+          console.warn('[CRM Upload Custom File] Note fallback failed:', noteRes.status, noteErr);
+        }
+      } catch (noteErr) {
+        console.warn('[CRM Upload Custom File] Note fallback error:', noteErr.message);
       }
     }
 
-    return res.json({ success: true, method: 'logged' });
+    // If we got here, native upload failed and note fallback also failed/unavailable
+    return res.status(207).json({
+      success: false,
+      message: 'File uploaded to website storage but could not be saved to CRM document vault. Check that the "Documents (File Upload)" field ID is set in Admin and that the CRM API token has forms.write scope.',
+    });
   } catch (error) {
     console.error('[CRM Upload Custom File] Exception:', error);
     return res.status(500).json({ message: error.message });
@@ -1433,4 +1427,3 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-```
