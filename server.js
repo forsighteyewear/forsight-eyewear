@@ -219,7 +219,7 @@ app.post('/api/generate-special', async (req, res) => {
     const generatedText = result.choices[0].message.content.trim();
     res.json({ description: generatedText });
   } catch (error) {
-    console.error('AI Generation Error:', error);
+    console.error("AI Generation Error:", error);
     res.status(500).json({ message: error.message || "Internal server error" });
   }
 });
@@ -260,7 +260,7 @@ app.post('/api/generate-blog', async (req, res) => {
     const generatedText = result.choices[0].message.content.trim();
     res.json({ content: generatedText });
   } catch (error) {
-    console.error('AI Generation Error:', error);
+    console.error("AI Generation Error:", error);
     res.status(500).json({ message: error.message || "Internal server error" });
   }
 });
@@ -302,7 +302,7 @@ app.post('/api/generate-brand-description', async (req, res) => {
     const generatedText = result.output_text?.trim() || "Generated description.";
     res.json({ description: generatedText });
   } catch (error) {
-    console.error('AI Generation Error:', error);
+    console.error("AI Generation Error:", error);
     res.status(500).json({ message: error.message || "Internal server error" });
   }
 });
@@ -1017,10 +1017,86 @@ app.post('/api/crm-documents/list', async (req, res) => {
   }
 });
 
+// ============================================================
+// Auto-tagging & categorized notes for uploaded documents
+// ============================================================
+
+/**
+ * Map a document category to a lowercase CRM tag slug.
+ * e.g. "Prescription" -> "doc-rx", "Insurance" -> "doc-insurance"
+ */
+function categoryToTag(category) {
+  if (!category) return null;
+  const map = {
+    'Prescription': 'doc-rx',
+    'Rx': 'doc-rx',
+    'Insurance': 'doc-insurance',
+    'ID': 'doc-id',
+    'Eye Exam': 'doc-exam',
+    'Exam': 'doc-exam',
+    'Invoice': 'doc-invoice',
+    'Other': 'doc-other',
+  };
+  return map[category] || `doc-${String(category).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
+}
+
+/**
+ * Add a tag to a CRM contact (e.g. doc-rx, doc-insurance, doc-exam).
+ */
+async function addDocumentTagToContact(crmConfig, contactId, category) {
+  const tag = categoryToTag(category);
+  if (!tag) return;
+  try {
+    await fetch(`${crmConfig.apiBase}/contacts/${contactId}/tags`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${crmConfig.apiKey}`,
+        'Content-Type': 'application/json',
+        'Version': '2021-07-28',
+      },
+      body: JSON.stringify({ tags: [tag] }),
+    });
+    console.log(`[CRM Upload Custom File] Tagged contact ${contactId} with "${tag}"`);
+  } catch (err) {
+    console.warn('[CRM Upload Custom File] Tagging failed:', err.message);
+  }
+}
+
+/**
+ * Add a categorized note to a CRM contact so the file shows up in activity/notes.
+ * Note body includes the category label and the file URL.
+ */
+async function addCategorizedNote(crmConfig, contactId, category, fileName, publicUrl) {
+  const label = category || 'Document';
+  const body = `[${label} Uploaded] ${fileName || 'File'}${publicUrl ? `: ${publicUrl}` : ''}`;
+  try {
+    const noteRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}/notes`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${crmConfig.apiKey}`,
+        'Content-Type': 'application/json',
+        'Version': '2021-07-28',
+      },
+      body: JSON.stringify({ body }),
+    });
+    if (noteRes.ok) {
+      console.log(`[CRM Upload Custom File] Categorized note added (${label})`);
+      return true;
+    } else {
+      const noteErr = await noteRes.text();
+      console.warn('[CRM Upload Custom File] Note failed:', noteRes.status, noteErr);
+      return false;
+    }
+  } catch (err) {
+    console.warn('[CRM Upload Custom File] Note error:', err.message);
+    return false;
+  }
+}
+
 // Endpoint to upload a file directly to CRM custom file fields or attachments
 app.post('/api/crm-upload-custom-file', async (req, res) => {
   try {
-    const { crmConfig, contactId, fileData, fileName, fileType, fieldId } = req.body;
+    const { crmConfig, contactId, fileData, fileName, fileType, fieldId, category } = req.body;
     if (!crmConfig?.apiBase || !crmConfig?.apiKey || !contactId || !fileData) {
       return res.status(400).json({ message: 'crmConfig, contactId, and fileData (base64 or URL) are required' });
     }
@@ -1075,6 +1151,12 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
 
         if (uploadRes.ok) {
           console.log('[CRM Upload Custom File] Success via upload-custom-files. Status:', uploadRes.status);
+          // Auto-tag the contact with the document category (e.g. rx, insurance, exam)
+          if (category) {
+            await addDocumentTagToContact(crmConfig, contactId, category);
+          }
+          // Also log a categorized note so it shows in contact activity
+          await addCategorizedNote(crmConfig, contactId, category, fileName, publicUrl);
           // The upload-custom-files endpoint returns the UPDATED CONTACT OBJECT —
           // the file URL is already written onto the custom field automatically.
           // No separate PUT is needed.
@@ -1095,20 +1177,12 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
     const publicUrl = fileData.startsWith('http') ? fileData : null;
     if (publicUrl) {
       try {
-        const noteRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}/notes`, {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${crmConfig.apiKey}`,
-            'Content-Type': 'application/json',
-            'Version': '2021-07-28',
-          },
-          body: JSON.stringify({ body: `[Document Uploaded] ${fileName || 'File'}: ${publicUrl}` }),
-        });
-        if (noteRes.ok) {
+        const noteOk = await addCategorizedNote(crmConfig, contactId, category, fileName, publicUrl);
+        if (category) {
+          await addDocumentTagToContact(crmConfig, contactId, category);
+        }
+        if (noteOk) {
           return res.json({ success: true, method: 'note', note: 'File logged to contact notes (native vault upload unavailable).' });
-        } else {
-          const noteErr = await noteRes.text();
-          console.warn('[CRM Upload Custom File] Note fallback failed:', noteRes.status, noteErr);
         }
       } catch (noteErr) {
         console.warn('[CRM Upload Custom File] Note fallback error:', noteErr.message);
