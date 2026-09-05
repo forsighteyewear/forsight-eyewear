@@ -6,6 +6,19 @@ import crypto from 'crypto';
 import cron from 'node-cron';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 
+/** Capitalize the first letter of each word in a name (e.g. "john" -> "John"). */
+const capitalizeName = (name) => {
+  if (!name) return '';
+  return String(name).trim().split(/\s+/).map((w) => w.length > 0 ? w[0].toUpperCase() + w.slice(1).toLowerCase() : w).join(' ');
+};
+
+/** Capitalize the first word of a name (first name only). */
+const capitalizeFirst = (name) => {
+  if (!name) return '';
+  const first = String(name).trim().split(/\s+/)[0];
+  return first ? first[0].toUpperCase() + first.slice(1).toLowerCase() : '';
+};
+
 dotenv.config();
 
 const app = express();
@@ -374,7 +387,7 @@ async function fetchAllCRMContacts(crmConfig) {
 
     return {
       id: c.id || Date.now().toString() + Math.random().toString(36),
-      name: `${c.firstName || ''} ${c.lastName || ''}`.trim() || 'Unknown',
+      name: capitalizeName(`${c.firstName || ''} ${c.lastName || ''}`.trim() || 'Unknown'),
       email: c.email || '',
       phone: c.phone || '',
       referralCode,
@@ -1031,9 +1044,6 @@ function categoryToTag(category) {
     'Prescription': 'doc-rx',
     'Rx': 'doc-rx',
     'Insurance': 'doc-insurance',
-    'ID': 'doc-id',
-    'Eye Exam': 'doc-exam',
-    'Exam': 'doc-exam',
     'Invoice': 'doc-invoice',
     'Other': 'doc-other',
   };
@@ -1421,7 +1431,7 @@ app.post('/api/crm-search-contacts', async (req, res) => {
       .slice(0, 50)
       .map((c) => ({
         id: c.id,
-        name: `${c.firstName || ''} ${c.lastName || ''}`.trim() || 'Unknown',
+        name: capitalizeName(`${c.firstName || ''} ${c.lastName || ''}`.trim() || 'Unknown'),
         email: c.email || '',
         phone: c.phone || '',
       }));
@@ -1493,8 +1503,237 @@ cron.schedule(CRON_SCHEDULE, async () => {
 
 console.log(`CRM sync cron scheduled: "${CRON_SCHEDULE}"`);
 
+// ============================================================
+// Contact Lens Reorder Reminders
+// ============================================================
+
+const CONTACT_LENS_INTERVALS = [1, 3, 6, 12];
+const DEFAULT_CONTACT_LENS_TEMPLATE =
+  "Hi {firstName}! It's been {months} months since you purchased your contact lenses at Forsight Eyewear. It may be time to reorder so you don't run out. Reply here or call us at (905) 667-1825 to place your order. — Forsight Eyewear";
+
+/**
+ * Send an SMS to a CRM contact by contactId.
+ */
+async function sendCRMSms(crmConfig, contactId, message) {
+  const smsRes = await fetch('https://services.leadconnectorhq.com/conversations/messages', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${crmConfig.apiKey}`,
+      'Content-Type': 'application/json',
+      'Version': '2021-07-28',
+    },
+    body: JSON.stringify({
+      type: 'SMS',
+      locationId: crmConfig.locationId,
+      contactId,
+      message,
+    }),
+  });
+  if (!smsRes.ok) {
+    const errData = await smsRes.json().catch(() => null);
+    throw new Error(errData?.message || `SMS send failed (${smsRes.status})`);
+  }
+  return await smsRes.json();
+}
+
+/**
+ * Look up a CRM contactId by phone number.
+ */
+async function findContactIdByPhone(crmConfig, phone) {
+  const normalizePhone = (p) => {
+    let digits = String(p || '').replace(/[^0-9]/g, '');
+    if (digits.length === 10 && !digits.startsWith('1')) digits = '1' + digits;
+    if (digits.length === 11 && digits.startsWith('1')) return '+' + digits;
+    if (digits.length === 10) return '+1' + digits;
+    return String(p || '').trim();
+  };
+  const params = new URLSearchParams({
+    locationId: crmConfig.locationId,
+    limit: '10',
+    query: normalizePhone(phone),
+  });
+  const res = await fetch(`https://backend.leadconnectorhq.com/contacts/?${params.toString()}`, {
+    headers: {
+      'Authorization': `Bearer ${crmConfig.apiKey}`,
+      'Content-Type': 'application/json',
+      'Version': '2021-07-28',
+    },
+  });
+  if (!res.ok) return '';
+  const data = await res.json();
+  const contacts = data?.contacts ?? [];
+  return contacts.length > 0 ? contacts[0].id : '';
+}
+
+/**
+ * Compute months elapsed since a purchase date (calendar months).
+ */
+function monthsSince(dateStr) {
+  const now = new Date();
+  const purchase = new Date(dateStr);
+  if (isNaN(purchase.getTime())) return 0;
+  let months = (now.getFullYear() - purchase.getFullYear()) * 12 +
+    (now.getMonth() - purchase.getMonth());
+  if (now.getDate() < purchase.getDate()) months -= 1;
+  return Math.max(0, months);
+}
+
+/**
+ * Process all due contact lens reminders stored in CMS data and send SMS.
+ * Returns a summary of sent/failed counts.
+ */
+async function processContactLensReminders(crmConfig, supabaseConfig) {
+  const cmsData = await downloadCMSFromSupabase(supabaseConfig);
+  if (!cmsData || !Array.isArray(cmsData.contactLensReminders)) {
+    return { checked: 0, sent: 0, failed: 0, details: [] };
+  }
+
+  const template = cmsData.contactLensTemplate || DEFAULT_CONTACT_LENS_TEMPLATE;
+  const reminders = cmsData.contactLensReminders;
+  let sent = 0;
+  let failed = 0;
+  const details = [];
+
+  for (const r of reminders) {
+    if (!r.active) continue;
+    const elapsed = monthsSince(r.purchaseDate);
+    for (const m of r.intervals) {
+      const alreadySent = (r.sentIntervals || []).includes(m);
+      if (alreadySent) continue;
+      if (elapsed >= m) {
+        // Due — send reminder
+        const firstName = capitalizeFirst(r.clientName || '') || 'there';
+        const messageBody = template
+          .replace(/\{firstName\}/g, firstName)
+          .replace(/\{months\}/g, String(m));
+        try {
+          let contactId = r.contactId || '';
+          if (!contactId) {
+            contactId = await findContactIdByPhone(crmConfig, r.phone);
+          }
+          if (!contactId) {
+            failed++;
+            details.push({ client: r.clientName, months: m, error: 'Contact not found in CRM' });
+            continue;
+          }
+          await sendCRMSms(crmConfig, contactId, messageBody);
+          // Mark this interval as sent
+          r.sentIntervals = Array.from(new Set([...(r.sentIntervals || []), m]));
+          r.contactId = contactId;
+          r.lastReminderSent = new Date().toISOString();
+          sent++;
+          details.push({ client: r.clientName, months: m, status: 'sent' });
+        } catch (err) {
+          failed++;
+          details.push({ client: r.clientName, months: m, error: err.message });
+        }
+      }
+    }
+  }
+
+  // Persist updated reminders back to Supabase
+  cmsData.contactLensReminders = reminders;
+  await uploadCMSToSupabase(supabaseConfig, cmsData);
+
+  return { checked: reminders.length, sent, failed, details };
+}
+
+// Manual endpoint to trigger reminder processing on demand
+app.post('/api/contact-lens-reminders/process', async (req, res) => {
+  try {
+    const { crmConfig, supabaseConfig } = req.body;
+    if (!crmConfig?.apiBase || !crmConfig?.apiKey || !crmConfig?.locationId) {
+      return res.status(400).json({ message: 'crmConfig (apiBase, apiKey, locationId) required' });
+    }
+    if (!supabaseConfig?.url || !supabaseConfig?.bucket) {
+      return res.status(400).json({ message: 'supabaseConfig (url, bucket) required' });
+    }
+    const result = await processContactLensReminders(crmConfig, supabaseConfig);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Contact lens reminder processing error:', error.message);
+    res.status(500).json({ message: error.message || 'Failed to process reminders' });
+  }
+});
+
+// Daily cron for contact lens reminders — runs at 10:00 AM server time
+const REMINDER_CRON = process.env.REMINDER_CRON || '0 10 * * *';
+cron.schedule(REMINDER_CRON, async () => {
+  console.log(`[${new Date().toISOString()}] Contact lens reminder cron triggered`);
+  const crmConfig = {
+    apiBase: process.env.CRM_API_BASE,
+    apiKey: process.env.CRM_API_KEY,
+    locationId: process.env.CRM_LOCATION_ID,
+  };
+  const supabaseConfig = {
+    url: process.env.SUPABASE_URL || 'https://vacmllwtvpehraaosmza.supabase.co',
+    anonKey: process.env.SUPABASE_ANON_KEY || '',
+    bucket: process.env.SUPABASE_BUCKET || 'videos',
+  };
+  if (!crmConfig.apiKey || !crmConfig.locationId) {
+    console.warn('Reminder cron skipped: CRM env vars not set');
+    return;
+  }
+  try {
+    const result = await processContactLensReminders(crmConfig, supabaseConfig);
+    console.log(`Contact lens reminders: ${result.sent} sent, ${result.failed} failed, ${result.checked} checked`);
+  } catch (error) {
+    console.error('Contact lens reminder cron failed:', error.message);
+  }
+});
+console.log(`Contact lens reminder cron scheduled: "${REMINDER_CRON}"`);
+
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Email proxy - sends an email to a contact via the CRM conversations API
+app.post('/api/send-referral-email', async (req, res) => {
+  try {
+    const { contactId, locationId, subject, message, apiKey } = req.body;
+
+    if (!contactId || !locationId || !message || !apiKey) {
+      return res.status(400).json({
+        message: 'contactId, locationId, message, and apiKey are required',
+      });
+    }
+
+    const emailRes = await fetch(
+      'https://services.leadconnectorhq.com/conversations/messages',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          Version: '2021-07-28',
+        },
+        body: JSON.stringify({
+          type: 'Email',
+          locationId,
+          contactId,
+          subject: subject || '',
+          html: message,
+          message,
+        }),
+      },
+    );
+
+    if (!emailRes.ok) {
+      const errData = await emailRes.json().catch(() => null);
+      throw new Error(
+        errData?.message || `Email send failed (${emailRes.status})`,
+      );
+    }
+
+    const result = await emailRes.json();
+    res.json({
+      success: true,
+      messageId: result?.id || result?.messageId || null,
+    });
+  } catch (error) {
+    console.error('Referral Email Error:', error.message);
+    res.status(500).json({ message: error.message || 'Failed to send email' });
+  }
 });
 
 const PORT = process.env.PORT || 3001;
