@@ -330,9 +330,9 @@ app.post('/api/generate-brand-description', async (req, res) => {
  * Fetch all contacts from the CRM with pagination.
  */
 async function fetchAllCRMContacts(crmConfig) {
-  const { apiBase, apiKey, locationId, fieldIdReferralCode, fieldIdCreditBalance, fieldIdTotalReferrals } = crmConfig;
+  const { apiKey, locationId, fieldIdReferralCode, fieldIdCreditBalance, fieldIdTotalReferrals } = crmConfig;
   let allContacts = [];
-  let fetchUrl = `${apiBase}/contacts/?locationId=${locationId}&limit=100`;
+  let fetchUrl = `https://backend.leadconnectorhq.com/contacts/?locationId=${locationId}&limit=100`;
 
   while (fetchUrl) {
     const response = await fetch(fetchUrl, {
@@ -357,12 +357,12 @@ async function fetchAllCRMContacts(crmConfig) {
       if (nextUrl.startsWith('http')) {
         fetchUrl = nextUrl;
       } else if (nextUrl.startsWith('/')) {
-        fetchUrl = `${apiBase}${nextUrl}`;
+        fetchUrl = `https://backend.leadconnectorhq.com${nextUrl}`;
       } else if (nextUrl.startsWith('?')) {
         const baseUrl = fetchUrl.split('?')[0];
         fetchUrl = `${baseUrl}${nextUrl}`;
       } else {
-        fetchUrl = `${apiBase}/${nextUrl}`;
+        fetchUrl = `https://backend.leadconnectorhq.com/${nextUrl}`;
       }
     } else {
       fetchUrl = "";
@@ -404,10 +404,10 @@ async function fetchAllCRMContacts(crmConfig) {
  * Push referral code back to a CRM contact.
  */
 async function pushReferralCodeToCRMContact(crmConfig, contactId, referralCode) {
-  const { apiBase, apiKey, fieldIdReferralCode } = crmConfig;
+  const { apiKey, fieldIdReferralCode } = crmConfig;
   if (!fieldIdReferralCode) return;
 
-  await fetch(`${apiBase}/contacts/${contactId}`, {
+  await fetch(`https://backend.leadconnectorhq.com/contacts/${contactId}`, {
     method: 'PUT',
     headers: {
       'Authorization': `Bearer ${apiKey}`,
@@ -717,7 +717,7 @@ app.post('/api/crm-documents/list', async (req, res) => {
 
     // Approach 1: Try the /contacts/{contactId}/documents endpoint
     try {
-      const docUrl = `${crmConfig.apiBase}/contacts/${contactId}/documents`;
+      const docUrl = `https://backend.leadconnectorhq.com/contacts/${contactId}/documents`;
       console.log(`[CRM Documents] Trying endpoint: ${docUrl}`);
       const response = await fetch(docUrl, {
         method: 'GET',
@@ -754,7 +754,7 @@ app.post('/api/crm-documents/list', async (req, res) => {
 
     // Approach 2: Fetch the contact and look for file/document URLs in ALL custom fields & contact properties
     try {
-      const contactUrl = `${crmConfig.apiBase}/contacts/${contactId}`;
+      const contactUrl = `https://backend.leadconnectorhq.com/contacts/${contactId}`;
       console.log(`[CRM Documents] Fetching contact: ${contactUrl}`);
       const contactRes = await fetch(contactUrl, {
         method: 'GET',
@@ -883,7 +883,7 @@ app.post('/api/crm-documents/list', async (req, res) => {
 
     // Approach 3: Fetch contact notes endpoint (/contacts/{contactId}/notes)
     try {
-      const notesUrl = `${crmConfig.apiBase}/contacts/${contactId}/notes`;
+      const notesUrl = `https://backend.leadconnectorhq.com/contacts/${contactId}/notes`;
       const notesRes = await fetch(notesUrl, {
         method: 'GET',
         headers: {
@@ -925,7 +925,7 @@ app.post('/api/crm-documents/list', async (req, res) => {
 
     // Approach 4: Fetch conversations for this contact and look for file attachments
     try {
-      const convoUrl = `${crmConfig.apiBase}/conversations?locationId=${crmConfig.locationId}&contactId=${contactId}&limit=50`;
+      const convoUrl = `https://services.leadconnectorhq.com/conversations?locationId=${crmConfig.locationId}&contactId=${contactId}&limit=50`;
       console.log(`[CRM Documents] Trying conversations: ${convoUrl}`);
       const convoRes = await fetch(convoUrl, {
         method: 'GET',
@@ -947,7 +947,7 @@ app.post('/api/crm-documents/list', async (req, res) => {
 
           // Fetch messages in this conversation
           try {
-            const msgUrl = `${crmConfig.apiBase}/conversations/${convoId}/messages?limit=100`;
+            const msgUrl = `https://services.leadconnectorhq.com/conversations/${convoId}/messages?limit=100`;
             const msgRes = await fetch(msgUrl, {
               method: 'GET',
               headers: {
@@ -1057,7 +1057,7 @@ async function addDocumentTagToContact(crmConfig, contactId, category) {
   const tag = categoryToTag(category);
   if (!tag) return;
   try {
-    await fetch(`${crmConfig.apiBase}/contacts/${contactId}/tags`, {
+    await fetch(`https://backend.leadconnectorhq.com/contacts/${contactId}/tags`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${crmConfig.apiKey}`,
@@ -1080,7 +1080,7 @@ async function addCategorizedNote(crmConfig, contactId, category, fileName, publ
   const label = category || 'Document';
   const body = `[${label} Uploaded] ${fileName || 'File'}${publicUrl ? `: ${publicUrl}` : ''}`;
   try {
-    const noteRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}/notes`, {
+    const noteRes = await fetch(`https://backend.leadconnectorhq.com/contacts/${contactId}/notes`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${crmConfig.apiKey}`,
@@ -1218,7 +1218,7 @@ app.post('/api/crm-contact-add-note', async (req, res) => {
       return res.status(400).json({ message: 'crmConfig, contactId, and note are required' });
     }
 
-    const noteRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}/notes`, {
+    const noteRes = await fetch(`https://backend.leadconnectorhq.com/contacts/${contactId}/notes`, {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${crmConfig.apiKey}`,
@@ -1288,7 +1288,7 @@ app.post('/api/crm-contact-debug', async (req, res) => {
       return res.status(400).json({ message: 'crmConfig and contactId required' });
     }
 
-    const contactRes = await fetch(`${crmConfig.apiBase}/contacts/${contactId}`, {
+    const contactRes = await fetch(`https://backend.leadconnectorhq.com/contacts/${contactId}`, {
       method: 'GET',
       headers: {
         'Authorization': `Bearer ${crmConfig.apiKey}`,
@@ -1304,7 +1304,7 @@ app.post('/api/crm-contact-debug', async (req, res) => {
     // Also try conversations listing
     let conversations = null;
     try {
-      const convoRes = await fetch(`${crmConfig.apiBase}/conversations?locationId=${crmConfig.locationId}&contactId=${contactId}&limit=10`, {
+      const convoRes = await fetch(`https://services.leadconnectorhq.com/conversations?locationId=${crmConfig.locationId}&contactId=${contactId}&limit=10`, {
         method: 'GET',
         headers: {
           'Authorization': `Bearer ${crmConfig.apiKey}`,
@@ -1332,11 +1332,14 @@ app.post('/api/crm-contact-debug', async (req, res) => {
 app.post('/api/crm-test', async (req, res) => {
   try {
     const { crmConfig } = req.body;
-    if (!crmConfig || !crmConfig.apiBase || !crmConfig.apiKey || !crmConfig.locationId) {
-      return res.status(400).json({ message: 'CRM config is incomplete. Set apiBase, apiKey, and locationId.' });
+    if (!crmConfig || !crmConfig.apiKey || !crmConfig.locationId) {
+      return res.status(400).json({ message: 'CRM config is incomplete. Set apiKey and locationId.' });
     }
 
-    const testUrl = `${crmConfig.apiBase}/contacts/?locationId=${crmConfig.locationId}&limit=1`;
+    // The Contacts API lives on backend.leadconnectorhq.com, NOT on the
+    // services base (apiBase). Testing against the services base returns
+    // "Invalid Private Integration token", so always use the contacts base.
+    const testUrl = `https://backend.leadconnectorhq.com/contacts/?locationId=${crmConfig.locationId}&limit=1`;
     const response = await fetch(testUrl, {
       method: 'GET',
       headers: {
@@ -1382,7 +1385,7 @@ app.post('/api/crm-search-contacts', async (req, res) => {
 
     const q = query.trim();
     let allContacts = [];
-    let fetchUrl = `${crmConfig.apiBase}/contacts/?locationId=${crmConfig.locationId}&limit=100`;
+    let fetchUrl = `https://backend.leadconnectorhq.com/contacts/?locationId=${crmConfig.locationId}&limit=100`;
 
     while (fetchUrl && allContacts.length < 500) {
       const response = await fetch(fetchUrl, {
@@ -1408,12 +1411,12 @@ app.post('/api/crm-search-contacts', async (req, res) => {
         if (nextUrl.startsWith('http')) {
           fetchUrl = nextUrl;
         } else if (nextUrl.startsWith('/')) {
-          fetchUrl = `${crmConfig.apiBase}${nextUrl}`;
+          fetchUrl = `https://backend.leadconnectorhq.com${nextUrl}`;
         } else if (nextUrl.startsWith('?')) {
           const baseUrl = fetchUrl.split('?')[0];
           fetchUrl = `${baseUrl}${nextUrl}`;
         } else {
-          fetchUrl = `${crmConfig.apiBase}/${nextUrl}`;
+          fetchUrl = `https://backend.leadconnectorhq.com/${nextUrl}`;
         }
       } else {
         fetchUrl = "";
