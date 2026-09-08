@@ -994,7 +994,7 @@ app.post('/api/crm-documents/list', async (req, res) => {
                         fileName: url.split('/').pop()?.split('?')[0] || 'Message File',
                         fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
                         fileSize: 0,
-                        uploadedAt: msg.dateAdded || msg.dateAdded || new Date().toISOString(),
+                        uploadedAt: msg.dateAdded || new Date().toISOString(),
                         category: 'Message File',
                         url,
                         source: 'crm',
