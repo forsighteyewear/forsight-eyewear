@@ -5,6 +5,7 @@ import dotenv from 'dotenv';
 import crypto from 'crypto';
 import cron from 'node-cron';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+import { registerCustomerDocUploadRoute } from './server-routes-customer-docs-upload.js';
 
 /** Capitalize the first letter of each word in a name (e.g. "john" -> "John"). */
 const capitalizeName = (name) => {
@@ -685,6 +686,7 @@ app.post('/api/customer-documents/list', async (req, res) => {
   }
 });
 
+registerCustomerDocUploadRoute(app);
 app.post('/api/customer-documents/delete', async (req, res) => {
   try {
     const { supabaseConfig, path } = req.body;
@@ -992,7 +994,7 @@ app.post('/api/crm-documents/list', async (req, res) => {
                         fileName: url.split('/').pop()?.split('?')[0] || 'Message File',
                         fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
                         fileSize: 0,
-                        uploadedAt: msg.dateAdded || new Date().toISOString(),
+                        uploadedAt: msg.dateAdded || msg.dateAdded || new Date().toISOString(),
                         category: 'Message File',
                         url,
                         source: 'crm',
