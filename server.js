@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 import crypto from 'crypto';
 import cron from 'node-cron';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
-import { registerCustomerDocUploadRoute } from './server-routes-customer-docs-upload.js';
+import { registerCustomerDocUploadRoute, resolveSupabaseConfig } from './server-routes-customer-docs-upload.js';
 
 /** Capitalize the first letter of each word in a name (e.g. "john" -> "John"). */
 const capitalizeName = (name) => {
@@ -648,59 +648,14 @@ async function performCRMSync(crmConfig, supabaseConfig) {
 }
 
 // ============================================================
-// Customer Documents — list & delete documents in Supabase storage
+// Customer Documents — upload, list & delete routes are registered
+// by registerCustomerDocUploadRoute (in server-routes-customer-docs-upload.js).
+// All three routes resolve Supabase config from client-sent values first,
+// then fall back to server env vars (SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_BUCKET).
 // ============================================================
 
-app.post('/api/customer-documents/list', async (req, res) => {
-  try {
-    const { supabaseConfig, clientId } = req.body;
-    if (!supabaseConfig?.url || !supabaseConfig?.anonKey || !supabaseConfig?.bucket) {
-      return res.status(400).json({ message: 'Supabase config required' });
-    }
-    const supabase = createSupabaseClient(supabaseConfig.url, supabaseConfig.anonKey);
-    const { data: files, error } = await supabase.storage
-      .from(supabaseConfig.bucket)
-      .list('customer-docs', { limit: 500, sortBy: { column: 'created_at', order: 'desc' } });
-
-    if (error) throw error;
-
-    const docs = (files || [])
-      .filter((f) => f.name.startsWith(clientId + '__'))
-      .map((f) => {
-        const parts = f.name.split('__');
-        return {
-          id: f.id || f.name,
-          fileName: parts.slice(2).join('__') || f.name,
-          fileType: f.metadata?.mimetype || 'application/octet-stream',
-          fileSize: f.metadata?.size || 0,
-          uploadedAt: f.created_at || new Date().toISOString(),
-          category: parts[1] || 'General',
-          url: `${supabaseConfig.url}/storage/v1/object/public/${supabaseConfig.bucket}/customer-docs/${encodeURIComponent(f.name)}`,
-          path: `customer-docs/${f.name}`,
-        };
-      });
-
-    res.json({ success: true, documents: docs });
-  } catch (error) {
-    res.status(500).json({ message: error.message || 'Failed to list documents' });
-  }
-});
-
 registerCustomerDocUploadRoute(app);
-app.post('/api/customer-documents/delete', async (req, res) => {
-  try {
-    const { supabaseConfig, path } = req.body;
-    if (!supabaseConfig?.url || !supabaseConfig?.anonKey || !supabaseConfig?.bucket || !path) {
-      return res.status(400).json({ message: 'Supabase config and file path required' });
-    }
-    const supabase = createSupabaseClient(supabaseConfig.url, supabaseConfig.anonKey);
-    const { error } = await supabase.storage.from(supabaseConfig.bucket).remove([path]);
-    if (error) throw error;
-    res.json({ success: true });
-  } catch (error) {
-    res.status(500).json({ message: error.message || 'Failed to delete document' });
-  }
-});
+
 
 // ============================================================
 // CRM Documents — fetch documents uploaded to a CRM contact
