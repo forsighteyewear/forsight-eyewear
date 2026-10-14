@@ -9,13 +9,21 @@ import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 export function resolveSupabaseConfig(clientConfig) {
   const PLACEHOLDERS = ['your_supabase_anon_key', 'your-anon-key', 'placeholder', 'xxx', ''];
   const isPlaceholder = (v) => !v || PLACEHOLDERS.includes(String(v).trim().toLowerCase());
-  const url = (clientConfig?.url && !isPlaceholder(clientConfig.url))
-    ? clientConfig.url
-    : (process.env.SUPABASE_URL && !isPlaceholder(process.env.SUPABASE_URL) ? process.env.SUPABASE_URL : '');
-  const anonKey = (clientConfig?.anonKey && !isPlaceholder(clientConfig.anonKey))
-    ? clientConfig.anonKey
-    : (process.env.SUPABASE_ANON_KEY && !isPlaceholder(process.env.SUPABASE_ANON_KEY) ? process.env.SUPABASE_ANON_KEY : '');
-  const bucket = clientConfig?.bucket || process.env.SUPABASE_BUCKET || 'videos';
+
+  // PREFER the server's own environment variables — they are known-good and
+  // configured on Render. Client-sent config is unreliable (stale/mismatched
+  // anon keys in the browser cause "signature verification failed" JWT
+  // errors). Only fall back to the client config if the server env vars are
+  // not set at all.
+  const envUrl = (process.env.SUPABASE_URL && !isPlaceholder(process.env.SUPABASE_URL)) ? process.env.SUPABASE_URL : '';
+  const envKey = (process.env.SUPABASE_ANON_KEY && !isPlaceholder(process.env.SUPABASE_ANON_KEY)) ? process.env.SUPABASE_ANON_KEY : '';
+  const envBucket = process.env.SUPABASE_BUCKET || 'videos';
+
+  const url = envUrl
+    || (clientConfig?.url && !isPlaceholder(clientConfig.url) ? clientConfig.url : '');
+  const anonKey = envKey
+    || (clientConfig?.anonKey && !isPlaceholder(clientConfig.anonKey) ? clientConfig.anonKey : '');
+  const bucket = envBucket || clientConfig?.bucket || 'videos';
   return { url, anonKey, bucket };
 }
 
