@@ -545,28 +545,19 @@ function deduplicateClients(clients) {
 }
 
 /**
- * Perform a full bidirectional sync:
- * 1. Download CMS data from Supabase
- * 2. Fetch all contacts from CRM
- * 3. Merge: update existing clients, add new ones, generate missing referral codes
- * 4. Deduplicate merged clients (by phone, email, referral code)
- * 5. Push missing referral codes back to CRM
- * 6. Upload deduplicated CMS data back to Supabase
+ * Perform a full bidirectional sync.
  */
 async function performCRMSync(crmConfig, supabaseConfig) {
   console.log(`[${new Date().toISOString()}] Starting CRM ↔ Supabase sync...`);
 
-  // Step 1: Download current CMS data from Supabase
   const cmsData = await downloadCMSFromSupabase(supabaseConfig);
   if (!cmsData) {
     throw new Error('Could not download CMS data from Supabase. Check bucket config.');
   }
 
-  // Step 2: Fetch all contacts from CRM
   const crmClients = await fetchAllCRMContacts(crmConfig);
   console.log(`  Fetched ${crmClients.length} contacts from CRM`);
 
-  // Step 3: Merge by ID, email, phone, or referral code
   const existingClients = [...(cmsData.referralClients || [])];
   const mergedClients = [...existingClients];
   const codesToPush = [];
@@ -624,13 +615,11 @@ async function performCRMSync(crmConfig, supabaseConfig) {
 
   console.log(`  Merged to ${mergedClients.length} total clients (${codesToPush.length} codes to push back)`);
 
-  // Step 4: Deduplicate merged clients before pushing to CRM / Supabase
   const { clients: dedupedClients, duplicatesRemoved, duplicateGroups } = deduplicateClients(mergedClients);
   if (duplicatesRemoved > 0) {
     console.log(`  Deduplicated: removed ${duplicatesRemoved} duplicates across ${duplicateGroups} groups (${mergedClients.length} → ${dedupedClients.length})`);
   }
 
-  // Step 5: Push missing referral codes back to CRM
   for (const item of codesToPush) {
     await pushReferralCodeToCRMContact(crmConfig, item.id, item.code);
   }
@@ -638,7 +627,6 @@ async function performCRMSync(crmConfig, supabaseConfig) {
     console.log(`  Pushed ${codesToPush.length} referral codes back to CRM`);
   }
 
-  // Step 6: Upload deduplicated CMS data back to Supabase
   cmsData.referralClients = dedupedClients;
   cmsData.lastCRMSync = new Date().toISOString();
   await uploadCMSToSupabase(supabaseConfig, cmsData);
@@ -650,8 +638,6 @@ async function performCRMSync(crmConfig, supabaseConfig) {
 // ============================================================
 // Customer Documents — upload, list & delete routes are registered
 // by registerCustomerDocUploadRoute (in server-routes-customer-docs-upload.js).
-// All three routes resolve Supabase config from client-sent values first,
-// then fall back to server env vars (SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_BUCKET).
 // ============================================================
 
 registerCustomerDocUploadRoute(app);
@@ -730,7 +716,6 @@ app.post('/api/crm-documents/list', async (req, res) => {
         const customFields = contact.customFields || contact.custom_fields || contact.customField || [];
         console.log(`[CRM Documents] Contact has ${customFields.length} custom fields`);
 
-        // Helper to extract URLs from any value (string, array, object, JSON)
         const extractUrls = (val) => {
           if (!val) return [];
           if (typeof val === 'string') {
@@ -752,13 +737,11 @@ app.post('/api/crm-documents/list', async (req, res) => {
           return [];
         };
 
-        // Check ALL custom fields for any URL or file path/value
         customFields.forEach((f) => {
           const fieldName = (f.name || f.fieldName || f.key || 'Custom Field').trim();
           const rawVal = f.value ?? f.fieldValue ?? f.values ?? f.valueArray ?? '';
           const urls = extractUrls(rawVal);
 
-          // If rawVal is an array of file objects or strings
           if (Array.isArray(rawVal)) {
             rawVal.forEach((item) => {
               const itemUrl = typeof item === 'string' ? item : item.url || item.fileUrl || item.link;
@@ -792,100 +775,42 @@ app.post('/api/crm-documents/list', async (req, res) => {
         });
         debugInfo.push(`Custom fields scanned: found ${documents.length} document links`);
 
-        // Check contact top-level object for any file/attachment properties
         const topLevelUrls = extractUrls({
           attachments: contact.attachments,
           files: contact.files,
           documents: contact.documents,
-          customField: contact.customField,
+          avatarUrl: contact.avatarUrl,
+          picture: contact.picture,
         });
-        topLevelUrls.forEach((url, idx) => {
+        topLevelUrls.forEach((url, uIdx) => {
           if (!documents.find(d => d.url === url)) {
+            const cleanFileName = url.split('/').pop()?.split('?')[0] || `Attachment ${uIdx}`;
             documents.push({
-              id: `top-file-${idx}`,
-              fileName: url.split('/').pop()?.split('?')[0] || 'Contact Attachment',
-              fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
+              id: `top-level-${uIdx}`,
+              fileName: cleanFileName.length > 50 ? cleanFileName.substring(0, 47) + '...' : cleanFileName,
+              fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' :
+                url.match(/\.(jpg|jpeg)$/i) ? 'image/jpeg' :
+                url.match(/\.(png)$/i) ? 'image/png' :
+                url.match(/\.(gif)$/i) ? 'image/gif' :
+                'application/octet-stream',
               fileSize: 0,
-              uploadedAt: contact.dateAdded || new Date().toISOString(),
+              uploadedAt: contact.dateAdded || contact.dateUpdated || new Date().toISOString(),
               category: 'Contact Attachment',
               url,
               source: 'crm',
             });
           }
         });
-
-        // Also check contact inline notes
-        const notes = contact.notes || '';
-        if (notes) {
-          const noteUrls = extractUrls(notes);
-          noteUrls.forEach((url, idx) => {
-            if (!documents.find(d => d.url === url)) {
-              documents.push({
-                id: `note-inline-${idx}`,
-                fileName: url.split('/').pop()?.split('?')[0] || 'Note Document',
-                fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
-                fileSize: 0,
-                uploadedAt: contact.dateAdded || new Date().toISOString(),
-                category: 'From Notes',
-                url,
-                source: 'crm',
-              });
-            }
-          });
-        }
       } else {
-        debugInfo.push(`Contact endpoint returned ${contactRes.status}`);
+        debugInfo.push(`Contact fetch returned ${contactRes.status}`);
       }
     } catch (e) {
       debugInfo.push(`Contact fetch error: ${e.message}`);
     }
 
-    // Approach 3: Fetch contact notes endpoint (/contacts/{contactId}/notes)
-    try {
-      const notesUrl = `https://backend.leadconnectorhq.com/contacts/${contactId}/notes`;
-      const notesRes = await fetch(notesUrl, {
-        method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${crmConfig.apiKey}`,
-          'Content-Type': 'application/json',
-          'Version': '2021-07-28',
-        },
-      });
-      if (notesRes.ok) {
-        const notesData = await notesRes.json();
-        const notesList = notesData.notes || notesData.data || (Array.isArray(notesData) ? notesData : []);
-        let notesDocCount = 0;
-        notesList.forEach((n, nIdx) => {
-          const body = n.body || n.note || n.text || '';
-          const matches = body.match(/https?:\/\/[^\s"',<>\]\)]+/gi) || [];
-          matches.forEach((url, uIdx) => {
-            if (!documents.find(d => d.url === url)) {
-              notesDocCount++;
-              documents.push({
-                id: n.id ? `${n.id}-${uIdx}` : `note-ep-${nIdx}-${uIdx}`,
-                fileName: url.split('/').pop()?.split('?')[0] || 'Note Attachment',
-                fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
-                fileSize: 0,
-                uploadedAt: n.dateAdded || n.createdAt || new Date().toISOString(),
-                category: 'Note Attachment',
-                url,
-                source: 'crm',
-              });
-            }
-          });
-        });
-        debugInfo.push(`Notes endpoint scanned: found ${notesDocCount} files`);
-      } else {
-        debugInfo.push(`Notes endpoint status: ${notesRes.status}`);
-      }
-    } catch (e) {
-      debugInfo.push(`Notes endpoint error: ${e.message}`);
-    }
-
-    // Approach 4: Fetch conversations for this contact and look for file attachments
+    // Approach 3: Fetch conversation attachments
     try {
       const convoUrl = `https://services.leadconnectorhq.com/conversations?locationId=${crmConfig.locationId}&contactId=${contactId}&limit=50`;
-      console.log(`[CRM Documents] Trying conversations: ${convoUrl}`);
       const convoRes = await fetch(convoUrl, {
         method: 'GET',
         headers: {
@@ -894,80 +819,33 @@ app.post('/api/crm-documents/list', async (req, res) => {
           'Version': '2021-07-28',
         },
       });
+
       if (convoRes.ok) {
         const convoData = await convoRes.json();
-        const conversations = convoData.conversations || convoData.data || [];
-        console.log(`[CRM Documents] Found ${conversations.length} conversations`);
-        let convoDocCount = 0;
-
-        for (const convo of conversations) {
-          const convoId = convo.id || convo.conversationId;
-          if (!convoId) continue;
-
-          // Fetch messages in this conversation
-          try {
-            const msgUrl = `https://services.leadconnectorhq.com/conversations/${convoId}/messages?limit=100`;
-            const msgRes = await fetch(msgUrl, {
-              method: 'GET',
-              headers: {
-                'Authorization': `Bearer ${crmConfig.apiKey}`,
-                'Content-Type': 'application/json',
-                'Version': '2021-07-28',
-              },
-            });
-            if (msgRes.ok) {
-              const msgData = await msgRes.json();
-              const messages = msgData.messages || msgData.data || [];
-              for (const msg of messages) {
-                // Check for attachments in the message
-                const attachments = msg.attachments || msg.files || msg.media || [];
-                if (Array.isArray(attachments)) {
-                  for (const att of attachments) {
-                    const attUrl = att.url || att.link || att.fileUrl || (typeof att === 'string' ? att : '');
-                    if (attUrl && !documents.find(d => d.url === attUrl)) {
-                      convoDocCount++;
-                      documents.push({
-                        id: att.id || `convo-${convoId}-${documents.length}`,
-                        fileName: att.name || att.fileName || attUrl.split('/').pop()?.split('?')[0] || 'Conversation Attachment',
-                        fileType: att.mimeType || att.contentType || (attUrl.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg'),
-                        fileSize: att.size || 0,
-                        uploadedAt: msg.dateAdded || msg.createdAt || new Date().toISOString(),
-                        category: 'Conversation Attachment',
-                        url: attUrl,
-                        source: 'crm',
-                      });
-                    }
-                  }
-                }
-                // Also check message body for file URLs
-                const body = msg.body || msg.message || msg.text || '';
-                if (body) {
-                  const bodyUrls = body.match(/https?:\/\/[^\s"',<>\]\)]+/gi) || [];
-                  for (const url of bodyUrls) {
-                    if (url.match(/\.(pdf|jpg|jpeg|png|gif|tiff?|webp|docx?|heic)$/i) && !documents.find(d => d.url === url)) {
-                      convoDocCount++;
-                      documents.push({
-                        id: `msg-${msg.id || documents.length}`,
-                        fileName: url.split('/').pop()?.split('?')[0] || 'Message File',
-                        fileType: url.match(/\.(pdf)$/i) ? 'application/pdf' : 'image/jpeg',
-                        fileSize: 0,
-                        uploadedAt: msg.dateAdded || new Date().toISOString(),
-                        category: 'Message File',
-                        url,
-                        source: 'crm',
-                      });
-                    }
-                  }
-                }
+        const conversations = convoData.conversations || [];
+        conversations.forEach((conv) => {
+          const attachments = conv.attachments || conv.attachment || [];
+          if (Array.isArray(attachments)) {
+            attachments.forEach((att, aIdx) => {
+              const url = att.url || att.link || att.fileUrl || '';
+              if (url && !documents.find(d => d.url === url)) {
+                documents.push({
+                  id: `convo-${conv.id || aIdx}-${aIdx}`,
+                  fileName: att.name || att.fileName || url.split('/').pop()?.split('?')[0] || 'Attachment',
+                  fileType: att.type || att.mimeType || 'application/octet-stream',
+                  fileSize: att.size || 0,
+                  uploadedAt: conv.dateAdded || new Date().toISOString(),
+                  category: 'Conversation Attachment',
+                  url,
+                  source: 'crm',
+                });
               }
-            }
-          } catch (e) {
-            // skip individual message fetch errors
+            });
           }
-        }
-        debugInfo.push(`Conversations scanned: found ${convoDocCount} files`);
+        });
+        debugInfo.push(`Conversations scanned: found ${documents.length} total`);
       } else {
-        debugInfo.push(`Conversations endpoint returned ${convoRes.status}`);
+        debugInfo.push(`Conversations returned ${convoRes.status}`);
       }
     } catch (e) {
       debugInfo.push(`Conversations error: ${e.message}`);
@@ -976,7 +854,6 @@ app.post('/api/crm-documents/list', async (req, res) => {
     console.log(`[CRM Documents] Total documents found: ${documents.length}`);
     console.log(`[CRM Documents] Debug: ${debugInfo.join('; ')}`);
 
-    // ALWAYS return 200 so the frontend doesn't throw
     return res.status(200).json({
       success: true,
       documents,
@@ -984,7 +861,6 @@ app.post('/api/crm-documents/list', async (req, res) => {
     });
   } catch (error) {
     console.error('[CRM Documents] Error:', error.message);
-    // Return 200 with empty array so frontend doesn't crash
     return res.status(200).json({ success: true, documents: [], debug: `Error: ${error.message}` });
   }
 });
@@ -993,10 +869,6 @@ app.post('/api/crm-documents/list', async (req, res) => {
 // Auto-tagging & categorized notes for uploaded documents
 // ============================================================
 
-/**
- * Map a document category to a lowercase CRM tag slug.
- * e.g. "Prescription" -> "doc-rx", "Insurance" -> "doc-insurance"
- */
 function categoryToTag(category) {
   if (!category) return null;
   const map = {
@@ -1009,9 +881,6 @@ function categoryToTag(category) {
   return map[category] || `doc-${String(category).toLowerCase().replace(/[^a-z0-9]+/g, '-')}`;
 }
 
-/**
- * Add a tag to a CRM contact (e.g. doc-rx, doc-insurance, doc-exam).
- */
 async function addDocumentTagToContact(crmConfig, contactId, category) {
   const tag = categoryToTag(category);
   if (!tag) return;
@@ -1031,10 +900,6 @@ async function addDocumentTagToContact(crmConfig, contactId, category) {
   }
 }
 
-/**
- * Add a categorized note to a CRM contact so the file shows up in activity/notes.
- * Note body includes the category label and the file URL.
- */
 async function addCategorizedNote(crmConfig, contactId, category, fileName, publicUrl) {
   const label = category || 'Document';
   const body = `[${label} Uploaded] ${fileName || 'File'}${publicUrl ? `: ${publicUrl}` : ''}`;
@@ -1070,11 +935,9 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
       return res.status(400).json({ message: 'crmConfig (apiKey, locationId), contactId, and fileData (base64 or URL) are required' });
     }
 
-    // Use native FormData & Blob (Node 18+ globals). node-fetch v3 does NOT export these.
     const NativeFormData = globalThis.FormData;
     const NativeBlob = globalThis.Blob;
 
-    // 1. Try forms/upload-custom-files endpoint if fieldId is provided
     if (fieldId && NativeFormData && NativeBlob) {
       try {
         const uploadUrl = `https://services.leadconnectorhq.com/forms/upload-custom-files?contactId=${contactId}&locationId=${crmConfig.locationId}`;
@@ -1086,7 +949,6 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
           fileBuffer = Buffer.from(base64Content, 'base64');
         } else if (fileData.startsWith('http')) {
           const fetched = await fetch(fileData);
-          // node-fetch v3 uses arrayBuffer(), not buffer()
           const ab = await fetched.arrayBuffer();
           fileBuffer = Buffer.from(ab);
         } else {
@@ -1095,9 +957,6 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
 
         const blob = new NativeBlob([fileBuffer], { type: fileType || 'application/octet-stream' });
 
-        // CRITICAL: CRM requires the multipart field key to be "<customFieldId>_<fileId>"
-        // where fileId is a randomly generated UUID. Appending just the fieldId is
-        // silently ignored by the API, which is why files never appeared in the CRM.
         const fileId = crypto.randomUUID();
         const fieldKey = `${fieldId}_${fileId}`;
         formData.append(fieldKey, blob, fileName || 'document.pdf');
@@ -1120,29 +979,21 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
 
         if (uploadRes.ok) {
           console.log('[CRM Upload Custom File] Success via upload-custom-files. Status:', uploadRes.status);
-          // Auto-tag the contact with the document category (e.g. rx, insurance, exam)
           if (category) {
             await addDocumentTagToContact(crmConfig, contactId, category);
           }
-          // Also log a categorized note so it shows in contact activity
           await addCategorizedNote(crmConfig, contactId, category, fileName, publicUrl);
-          // The upload-custom-files endpoint returns the UPDATED CONTACT OBJECT —
-          // the file URL is already written onto the custom field automatically.
-          // No separate PUT is needed.
           return res.json({ success: true, method: 'upload-custom-files', data: uploadJson });
         } else {
           console.warn('[CRM Upload Custom File] upload-custom-files returned status:', uploadRes.status, uploadText);
-          // Don't return yet — fall through to note fallback so the file is at least logged
         }
       } catch (err) {
         console.warn('[CRM Upload Custom File] Error during upload-custom-files:', err.message);
-        // Fall through to note fallback
       }
     } else if (!fieldId) {
       console.warn('[CRM Upload Custom File] No fieldId (Documents File Upload field) configured — skipping native vault upload.');
     }
 
-    // 2. Fallback: Always attach a note with the document link so it registers under contact activity & notes
     const publicUrl = fileData.startsWith('http') ? fileData : null;
     if (publicUrl) {
       try {
@@ -1158,7 +1009,6 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
       }
     }
 
-    // If we got here, native upload failed and note fallback also failed/unavailable
     return res.status(207).json({
       success: false,
       message: 'File uploaded to website storage but could not be saved to CRM document vault. Check that the "Documents (File Upload)" field ID is set in Admin and that the CRM API token has forms.write scope.',
@@ -1169,7 +1019,7 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
   }
 });
 
-// Endpoint to add a note to a CRM contact (logs uploaded document URL directly into contact notes)
+// Endpoint to add a note to a CRM contact
 app.post('/api/crm-contact-add-note', async (req, res) => {
   try {
     const { crmConfig, contactId, note } = req.body;
@@ -1239,7 +1089,7 @@ app.post('/api/send-referral-sms', async (req, res) => {
   }
 });
 
-// Debug endpoint — dumps raw contact data to see what fields/attachments exist
+// Debug endpoint — dumps raw contact data
 app.post('/api/crm-contact-debug', async (req, res) => {
   try {
     const { crmConfig, contactId } = req.body;
@@ -1260,7 +1110,6 @@ app.post('/api/crm-contact-debug', async (req, res) => {
     let contactJson;
     try { contactJson = JSON.parse(contactText); } catch (_) { contactJson = { raw: contactText }; }
 
-    // Also try conversations listing
     let conversations = null;
     try {
       const convoRes = await fetch(`https://services.leadconnectorhq.com/conversations?locationId=${crmConfig.locationId}&contactId=${contactId}&limit=10`, {
@@ -1287,7 +1136,7 @@ app.post('/api/crm-contact-debug', async (req, res) => {
   }
 });
 
-// CRM connection test endpoint (called by Admin "Test Connection" button)
+// CRM connection test endpoint
 app.post('/api/crm-test', async (req, res) => {
   try {
     const { crmConfig } = req.body;
@@ -1295,9 +1144,6 @@ app.post('/api/crm-test', async (req, res) => {
       return res.status(400).json({ message: 'CRM config is incomplete. Set apiKey and locationId.' });
     }
 
-    // The Contacts API lives on backend.leadconnectorhq.com, NOT on the
-    // services base (apiBase). Testing against the services base returns
-    // "Invalid Private Integration token", so always use the contacts base.
     const testUrl = `https://backend.leadconnectorhq.com/contacts/?locationId=${crmConfig.locationId}&limit=1`;
     const response = await fetch(testUrl, {
       method: 'GET',
@@ -1313,7 +1159,6 @@ app.post('/api/crm-test', async (req, res) => {
       const totalContacts = result.meta?.total || result.contacts?.length || 0;
       res.json({ success: true, totalContacts });
     } else {
-      // Return the EXACT error from the CRM API
       let errMsg = `HTTP ${response.status}`;
       let rawBody = '';
       try {
@@ -1331,7 +1176,7 @@ app.post('/api/crm-test', async (req, res) => {
   }
 });
 
-// CRM Contact Search — search contacts directly from the CRM
+// CRM Contact Search
 app.post('/api/crm-search-contacts', async (req, res) => {
   try {
     const { crmConfig, query } = req.body;
@@ -1405,7 +1250,7 @@ app.post('/api/crm-search-contacts', async (req, res) => {
   }
 });
 
-// Manual sync endpoint (called by Admin "Sync Now" button)
+// Manual sync endpoint
 app.post('/api/crm-sync', async (req, res) => {
   try {
     const { crmConfig, supabaseConfig } = req.body;
@@ -1429,12 +1274,11 @@ app.post('/api/crm-sync', async (req, res) => {
 // Daily Cron Job — runs at 3:00 AM server time
 // ============================================================
 
-const CRON_SCHEDULE = process.env.CRM_SYNC_CRON || '0 3 * * *'; // default: 3 AM daily
+const CRON_SCHEDULE = process.env.CRM_SYNC_CRON || '0 3 * * *';
 
 cron.schedule(CRON_SCHEDULE, async () => {
   console.log(`[${new Date().toISOString()}] Daily CRM sync cron triggered`);
 
-  // The cron needs the CRM + Supabase config. These come from environment variables.
   const crmConfig = {
     apiKey: process.env.CRM_API_KEY,
     locationId: process.env.CRM_LOCATION_ID,
@@ -1472,9 +1316,6 @@ const CONTACT_LENS_INTERVALS = [1, 3, 6, 12];
 const DEFAULT_CONTACT_LENS_TEMPLATE =
   "Hi {firstName}! It's been {months} months since you purchased your contact lenses at Forsight Eyewear. It may be time to reorder so you don't run out. Reply here or call us at (905) 667-1825 to place your order. — Forsight Eyewear";
 
-/**
- * Send an SMS to a CRM contact by contactId.
- */
 async function sendCRMSms(crmConfig, contactId, message) {
   const smsRes = await fetch('https://services.leadconnectorhq.com/conversations/messages', {
     method: 'POST',
@@ -1497,9 +1338,6 @@ async function sendCRMSms(crmConfig, contactId, message) {
   return await smsRes.json();
 }
 
-/**
- * Look up a CRM contactId by phone number.
- */
 async function findContactIdByPhone(crmConfig, phone) {
   const normalizePhone = (p) => {
     let digits = String(p || '').replace(/[^0-9]/g, '');
@@ -1526,9 +1364,6 @@ async function findContactIdByPhone(crmConfig, phone) {
   return contacts.length > 0 ? contacts[0].id : '';
 }
 
-/**
- * Compute months elapsed since a purchase date (calendar months).
- */
 function monthsSince(dateStr) {
   const now = new Date();
   const purchase = new Date(dateStr);
@@ -1539,10 +1374,6 @@ function monthsSince(dateStr) {
   return Math.max(0, months);
 }
 
-/**
- * Process all due contact lens reminders stored in CMS data and send SMS.
- * Returns a summary of sent/failed counts.
- */
 async function processContactLensReminders(crmConfig, supabaseConfig) {
   const cmsData = await downloadCMSFromSupabase(supabaseConfig);
   if (!cmsData || !Array.isArray(cmsData.contactLensReminders)) {
@@ -1562,7 +1393,6 @@ async function processContactLensReminders(crmConfig, supabaseConfig) {
       const alreadySent = (r.sentIntervals || []).includes(m);
       if (alreadySent) continue;
       if (elapsed >= m) {
-        // Due — send reminder
         const firstName = capitalizeFirst(r.clientName || '') || 'there';
         const messageBody = template
           .replace(/\{firstName\}/g, firstName)
@@ -1578,7 +1408,6 @@ async function processContactLensReminders(crmConfig, supabaseConfig) {
             continue;
           }
           await sendCRMSms(crmConfig, contactId, messageBody);
-          // Mark this interval as sent
           r.sentIntervals = Array.from(new Set([...(r.sentIntervals || []), m]));
           r.contactId = contactId;
           r.lastReminderSent = new Date().toISOString();
@@ -1592,14 +1421,12 @@ async function processContactLensReminders(crmConfig, supabaseConfig) {
     }
   }
 
-  // Persist updated reminders back to Supabase
   cmsData.contactLensReminders = reminders;
   await uploadCMSToSupabase(supabaseConfig, cmsData);
 
   return { checked: reminders.length, sent, failed, details };
 }
 
-// Manual endpoint to trigger reminder processing on demand
 app.post('/api/contact-lens-reminders/process', async (req, res) => {
   try {
     const { crmConfig, supabaseConfig } = req.body;
@@ -1617,7 +1444,6 @@ app.post('/api/contact-lens-reminders/process', async (req, res) => {
   }
 });
 
-// Daily cron for contact lens reminders — runs at 10:00 AM server time
 const REMINDER_CRON = process.env.REMINDER_CRON || '0 10 * * *';
 cron.schedule(REMINDER_CRON, async () => {
   console.log(`[${new Date().toISOString()}] Contact lens reminder cron triggered`);
