@@ -6,6 +6,8 @@ import crypto from 'crypto';
 import cron from 'node-cron';
 import { createClient as createSupabaseClient } from '@supabase/supabase-js';
 import { registerCustomerDocUploadRoute, resolveSupabaseConfig } from './server-routes-customer-docs-upload.js';
+import { registerGoogleReviewsRoute } from './server-routes-google-reviews.js';
+import { registerContactFormRoute } from './server-routes-contact-form.js';
 
 /** Capitalize the first letter of each word in a name (e.g. "john" -> "John"). */
 const capitalizeName = (name) => {
@@ -324,8 +326,6 @@ app.post('/api/generate-brand-description', async (req, res) => {
 // ============================================================
 // CRM ↔ Supabase Bidirectional Sync
 // ============================================================
-
-// (imports moved to top of file)
 
 /**
  * Fetch all contacts from the CRM with pagination.
@@ -655,6 +655,8 @@ async function performCRMSync(crmConfig, supabaseConfig) {
 // ============================================================
 
 registerCustomerDocUploadRoute(app);
+registerGoogleReviewsRoute(app);
+registerContactFormRoute(app);
 
 
 // ============================================================
