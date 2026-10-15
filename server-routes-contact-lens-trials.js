@@ -20,7 +20,7 @@ const DEFAULT_TRIAL_TEMPLATES = {
   after:
     "FORSIGHT EYEWEAR – CONTACT LENS CARE & INSTRUCTIONS\n\nHello {firstName},\n\nThank you for visiting Forsight Eyewear today for your contact lens fitting and training appointment!\n\nWe hope you're enjoying your new contact lenses.\n\nIMPORTANT – CARING FOR YOUR CONTACT LENSES\n\nYour eye health and comfort are our priorities. Please remember the instructions provided during your appointment.\n\n1. INSERTING & REMOVING YOUR LENSES\n\nAlways wash and thoroughly dry your hands before handling your lenses.\n\nFollow the insertion and removal techniques demonstrated during your appointment.\n\nNever force a lens into or out of your eye.\n\nIf you're having difficulty, contact our clinic for assistance.\n\n2. WEARING YOUR TRIAL LENSES\n\nFollow the wearing schedule provided by your eye-care professional.\n\nNever sleep in your contact lenses unless specifically instructed by your eye-care professional.\n\nNever use tap water or saliva to clean or store contact lenses.\n\nFollow the specific replacement and care instructions for your prescribed lens type.\n\n3. COMFORT & VISION\n\nAs you become accustomed to your new lenses, please pay attention to:\n\nOverall comfort\n\nClarity of vision\n\nDryness or irritation\n\nAny difficulties inserting or removing your lenses\n\nIMPORTANT: If you experience eye pain, significant redness, unusual light sensitivity or changes in vision, remove your lenses immediately and seek prompt professional eye care.\n\n4. YOUR TRIAL PERIOD\n\nYour contact lens trial allows you to evaluate comfort and vision before purchasing your lenses.\n\nPLEASE NOTE: You have 45 days from your fitting appointment to place your contact lens order. After this period, another fitting assessment will be required.\n\n5. WE'LL CHECK IN WITH YOU\n\nWe'll send you a short follow-up message in approximately 7 days to see how you're doing.\n\nIf you experience any difficulties before then, please contact us at {storePhone}.\n\nPLEASE REPLY YES to acknowledge that you have received these instructions.\n\nThank you for choosing Forsight Eyewear!\n\nWe're here to help you see clearly and comfortably. — {storeName}",
   followup:
-    "Forsight Eyewear — Hi {firstName}, it's {staffMember} from {storeName}. How are your trial contact lenses feeling? Any dryness, discomfort, or vision issues?\n\nYour comfort and vision are our priority. If anything feels off, let us know right away so we can adjust the lens or schedule a follow-up. Call us at {storePhone}.\n\nIf everything's going well, we'd love to get you set up with your own supply. — {storeName}",
+    "Hi {firstName}, it's the Forsight Eyewear team at {storeName}.\n\nHow are your trial contact lenses feeling?\n\nIf everything is going well and you're ready to order your contact lens supply, we'd love to help you get started.\n\nReply YES if you'd like to move forward, and our team will contact you as soon as possible to discuss your options.",
   expiry:
     "Forsight Eyewear — Hi {firstName}, your contact lens trial period has come to an end and it's time to return or replace your trial lenses.\n\nPlease drop by {storeName} so we can check your eyes, review how the lenses worked for you, and discuss your next steps — whether that's ordering your own supply or trying a different option.\n\nCall us at {storePhone} to arrange a visit. — {storeName}",
 };
@@ -232,6 +232,200 @@ export function registerContactLensTrialRoute(
   downloadCMSFromSupabase,
   uploadCMSToSupabase,
 ) {
+  // CRM Invoice endpoint — uses the text2pay endpoint to create an invoice
+  // with the amount & item description pre-loaded AND text the real checkout
+  // payment link to the contact in a single call. Returns the invoiceUrl so
+  // the client can fall back to a direct SMS with the real checkout link.
+  app.post('/api/create-crm-invoice', async (req, res) => {
+    try {
+      const { contactId, name, amount, note, currency, crmConfig } = req.body;
+      if (!contactId || !amount) {
+        return res
+          .status(400)
+          .json({ message: 'contactId and amount are required' });
+      }
+
+      const apiKey =
+        crmConfig?.apiKey ||
+        process.env.CRM_API_KEY ||
+        'pit-d8fac32c-2f53-4547-95d3-00591506571a';
+      const locationId =
+        crmConfig?.locationId ||
+        process.env.CRM_LOCATION_ID ||
+        'ReWlxWSh0TQg1jBuQmf1';
+      const todayStr = new Date().toISOString().split('T')[0];
+      const cur = currency || 'CAD';
+
+      // 1. Fetch contact details to populate required contactDetails object
+      let contactDetails = { id: contactId, name: 'Valued Customer' };
+      try {
+        const contactRes = await fetch(
+          `https://backend.leadconnectorhq.com/contacts/${contactId}?locationId=${locationId}`,
+          {
+            headers: {
+              Authorization: `Bearer ${apiKey}`,
+              Version: '2021-07-28',
+            },
+          },
+        );
+        if (contactRes.ok) {
+          const contactData = await contactRes.json();
+          const c = contactData?.contact || contactData;
+          contactDetails = {
+            id: c.id,
+            name:
+              c.name ||
+              `${c.firstName || ''} ${c.lastName || ''}`.trim() ||
+              'Valued Customer',
+            phoneNo: c.phone || '',
+            email: c.email || '',
+          };
+        }
+      } catch {
+        /* use fallback */
+      }
+
+      // 2. Build the invoice payload — amount + description pre-loaded
+      const invoicePayload = {
+        altId: locationId,
+        altType: 'location',
+        name: name || 'Contact Lens Order',
+        title: 'INVOICE',
+        currency: cur,
+        issueDate: todayStr,
+        dueDate: todayStr,
+        liveMode: true,
+        contactDetails,
+        items: [
+          {
+            name: note || 'Contact Lens Purchase',
+            description: note || 'Contact Lens Purchase',
+            amount: Number(amount),
+            qty: 1,
+            currency: cur,
+            type: 'one_time',
+          },
+        ],
+        discount: { value: 0, type: 'percentage' },
+        sentTo: {
+          email: contactDetails.email ? [contactDetails.email] : [],
+          phoneNo: contactDetails.phoneNo ? [contactDetails.phoneNo] : [],
+        },
+      };
+
+      // 3. Use text2pay — creates the invoice AND texts the payment link
+      //    (with the amount + item pre-loaded) to the contact in one call.
+      const text2payRes = await fetch(
+        'https://services.leadconnectorhq.com/invoices/text2pay',
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+            Version: 'v3',
+          },
+          body: JSON.stringify(invoicePayload),
+        },
+      );
+
+      if (!text2payRes.ok) {
+        const errText = await text2payRes.text();
+        console.error('[Create CRM Invoice] text2pay error:', errText);
+
+        // Fallback to two-step create + send if text2pay is unavailable
+        try {
+          const createRes = await fetch(
+            'https://services.leadconnectorhq.com/invoices/',
+            {
+              method: 'POST',
+              headers: {
+                Authorization: `Bearer ${apiKey}`,
+                'Content-Type': 'application/json',
+                Version: 'v3',
+              },
+              body: JSON.stringify(invoicePayload),
+            },
+          );
+          if (createRes.ok) {
+            const createdData = await createRes.json();
+            const invoiceId =
+              createdData?._id || createdData?.invoice?._id || createdData?.id;
+            if (invoiceId) {
+              // Send via SMS + Email
+              await fetch(
+                `https://services.leadconnectorhq.com/invoices/${invoiceId}/send`,
+                {
+                  method: 'POST',
+                  headers: {
+                    Authorization: `Bearer ${apiKey}`,
+                    'Content-Type': 'application/json',
+                    Version: 'v3',
+                  },
+                  body: JSON.stringify({
+                    altId: locationId,
+                    altType: 'location',
+                    action: 'sms_and_email',
+                    liveMode: true,
+                  }),
+                },
+              ).catch(() => null);
+              return res.json({
+                success: true,
+                invoiceId,
+                invoiceUrl: createdData?.invoiceUrl || '',
+                amount: Number(amount),
+                currency: cur,
+                sent: true,
+              });
+            }
+          }
+        } catch (fallbackErr) {
+          console.error(
+            '[Create CRM Invoice] fallback create error:',
+            fallbackErr?.message,
+          );
+        }
+
+        return res
+          .status(text2payRes.status)
+          .json({ message: 'Failed to create CRM invoice', details: errText });
+      }
+
+      const createdData = await text2payRes.json();
+      const invoice =
+        createdData?.invoice || createdData?.data?.invoice || createdData;
+      const invoiceId =
+        invoice?._id || createdData?._id || createdData?.id;
+      const invoiceUrl =
+        createdData?.invoiceUrl ||
+        invoice?.invoiceUrl ||
+        createdData?.url ||
+        invoice?.url ||
+        '';
+
+      if (!invoiceId) {
+        return res.status(500).json({
+          message: 'Invoice created but no invoiceId returned',
+          raw: createdData,
+        });
+      }
+
+      res.json({
+        success: true,
+        invoiceId,
+        invoiceUrl,
+        amount: Number(amount),
+        currency: cur,
+        sent: true,
+        raw: createdData,
+      });
+    } catch (error) {
+      console.error('[Create CRM Invoice] error:', error);
+      res
+        .status(500)
+        .json({ message: error?.message || 'Server error creating invoice' });
+    }
+  });
   // Manual endpoint to trigger trial processing on demand
   app.post('/api/contact-lens-trials/process', async (req, res) => {
     try {
