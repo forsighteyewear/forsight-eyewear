@@ -328,8 +328,6 @@ app.post('/api/generate-brand-description', async (req, res) => {
 // CRM ↔ Supabase Bidirectional Sync
 // ============================================================
 
-// (imports moved to top of file)
-
 /**
  * Fetch all contacts from the CRM with pagination.
  */
