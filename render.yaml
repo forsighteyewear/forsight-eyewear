@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: forsight-backend
+    runtime: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    healthCheckPath: /api/health
+    envVars:
+      - key: CRM_API_KEY
+        value: pit-d8fac32c-2f53-4547-95d3-00591506571a
+      - key: CRM_LOCATION_ID
+        value: ReWlxWSh0TQg1jBuQmf1
+      - key: SUPABASE_URL
+        value: https://vacmllwtvpehraaosmza.supabase.co
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_BUCKET
+        value: videos
+      - key: CRM_SYNC_CRON
+        value: "0 3 * * *"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: GA4_SERVICE_ACCOUNT_EMAIL
+        sync: false
+      - key: GA4_SERVICE_ACCOUNT_PRIVATE_KEY
+        sync: false
