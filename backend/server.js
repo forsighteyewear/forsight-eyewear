@@ -1411,3 +1411,216 @@ cron.schedule(CRON_SCHEDULE, async () => {
     locationId: process.env.CRM_LOCATION_ID,
     fieldIdReferralCode: process.env.CRM_FIELD_REFERRAL_CODE || '',
     fieldIdCreditBalance: process.env.CRM_FIELD_CREDIT_BALANCE || '',
+    fieldIdTotalReferrals: process.env.CRM_FIELD_TOTAL_REFERRALS || '',
+  };
+
+  const supabaseConfig = {
+    url: process.env.SUPABASE_URL || 'https://vacmllwtvpehraaosmza.supabase.co',
+    anonKey: process.env.SUPABASE_ANON_KEY || '',
+    bucket: process.env.SUPABASE_BUCKET || 'videos',
+  };
+
+  if (!crmConfig.apiKey || !crmConfig.locationId) {
+    console.warn('Cron sync skipped: CRM env vars not set (CRM_API_KEY, CRM_LOCATION_ID)');
+    return;
+  }
+
+  try {
+    const result = await performCRMSync(crmConfig, supabaseConfig);
+    console.log(`Cron sync result:`, result);
+  } catch (error) {
+    console.error('Cron sync failed:', error.message);
+  }
+});
+
+console.log(`CRM sync cron scheduled: "${CRON_SCHEDULE}"`);
+
+// ============================================================
+// Contact Lens Reorder Reminders
+// ============================================================
+
+const CONTACT_LENS_INTERVALS = [1, 3, 6, 12];
+const DEFAULT_CONTACT_LENS_TEMPLATE =
+  "Hi {firstName}! It's been {months} months since you purchased your contact lenses at Forsight Eyewear. It may be time to reorder so you don't run out. Reply here or call us at (905) 667-1825 to place your order. — Forsight Eyewear";
+
+/**
+ * Send an SMS to a CRM contact by contactId.
+ */
+async function sendCRMSms(crmConfig, contactId, message) {
+  const smsRes = await fetch('https://services.leadconnectorhq.com/conversations/messages', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${crmConfig.apiKey}`,
+      'Content-Type': 'application/json',
+      'Version': '2021-07-28',
+    },
+    body: JSON.stringify({
+      type: 'SMS',
+      locationId: crmConfig.locationId,
+      contactId,
+      message,
+    }),
+  });
+  if (!smsRes.ok) {
+    const errData = await smsRes.json().catch(() => null);
+    throw new Error(errData?.message || `SMS send failed (${smsRes.status})`);
+  }
+  return await smsRes.json();
+}
+
+/**
+ * Look up a CRM contactId by phone number.
+ */
+async function findContactIdByPhone(crmConfig, phone) {
+  const normalizePhone = (p) => {
+    let digits = String(p || '').replace(/[^0-9]/g, '');
+    if (digits.length === 10 && !digits.startsWith('1')) digits = '1' + digits;
+    if (digits.length === 11 && digits.startsWith('1')) return '+' + digits;
+    if (digits.length === 10) return '+1' + digits;
+    return String(p || '').trim();
+  };
+  const params = new URLSearchParams({
+    locationId: crmConfig.locationId,
+    limit: '10',
+    query: normalizePhone(phone),
+  });
+  const res = await fetch(`https://backend.leadconnectorhq.com/contacts/?${params.toString()}`, {
+    headers: {
+      'Authorization': `Bearer ${crmConfig.apiKey}`,
+      'Content-Type': 'application/json',
+      'Version': '2021-07-28',
+    },
+  });
+  if (!res.ok) return '';
+  const data = await res.json();
+  const contacts = data?.contacts ?? [];
+  return contacts.length > 0 ? contacts[0].id : '';
+}
+
+/**
+ * Compute months elapsed since a purchase date (calendar months).
+ */
+function monthsSince(dateStr) {
+  const now = new Date();
+  const purchase = new Date(dateStr);
+  if (isNaN(purchase.getTime())) return 0;
+  let months = (now.getFullYear() - purchase.getFullYear()) * 12 +
+    (now.getMonth() - purchase.getMonth());
+  if (now.getDate() < purchase.getDate()) months -= 1;
+  return Math.max(0, months);
+}
+
+/**
+ * Process all due contact lens reminders stored in CMS data and send SMS.
+ * Returns a summary of sent/failed counts.
+ */
+async function processContactLensReminders(crmConfig, supabaseConfig) {
+  const cmsData = await downloadCMSFromSupabase(supabaseConfig);
+  if (!cmsData || !Array.isArray(cmsData.contactLensReminders)) {
+    return { checked: 0, sent: 0, failed: 0, details: [] };
+  }
+
+  const template = cmsData.contactLensTemplate || DEFAULT_CONTACT_LENS_TEMPLATE;
+  const reminders = cmsData.contactLensReminders;
+  let sent = 0;
+  let failed = 0;
+  const details = [];
+
+  for (const r of reminders) {
+    if (!r.active) continue;
+    const elapsed = monthsSince(r.purchaseDate);
+    for (const m of r.intervals) {
+      const alreadySent = (r.sentIntervals || []).includes(m);
+      if (alreadySent) continue;
+      if (elapsed >= m) {
+        // Due — send reminder
+        const firstName = capitalizeFirst(r.clientName || '') || 'there';
+        const messageBody = template
+          .replace(/\{firstName\}/g, firstName)
+          .replace(/\{months\}/g, String(m));
+        try {
+          let contactId = r.contactId || '';
+          if (!contactId) {
+            contactId = await findContactIdByPhone(crmConfig, r.phone);
+          }
+          if (!contactId) {
+            failed++;
+            details.push({ client: r.clientName, months: m, error: 'Contact not found in CRM' });
+            continue;
+          }
+          await sendCRMSms(crmConfig, contactId, messageBody);
+          // Mark this interval as sent
+          r.sentIntervals = Array.from(new Set([...(r.sentIntervals || []), m]));
+          r.contactId = contactId;
+          r.lastReminderSent = new Date().toISOString();
+          sent++;
+          details.push({ client: r.clientName, months: m, status: 'sent' });
+        } catch (err) {
+          failed++;
+          details.push({ client: r.clientName, months: m, error: err.message });
+        }
+      }
+    }
+  }
+
+  // Persist updated reminders back to Supabase
+  cmsData.contactLensReminders = reminders;
+  await uploadCMSToSupabase(supabaseConfig, cmsData);
+
+  return { checked: reminders.length, sent, failed, details };
+}
+
+// Manual endpoint to trigger reminder processing on demand
+app.post('/api/contact-lens-reminders/process', async (req, res) => {
+  try {
+    const { crmConfig, supabaseConfig } = req.body;
+    if (!crmConfig?.apiKey || !crmConfig?.locationId) {
+      return res.status(400).json({ message: 'crmConfig (apiKey, locationId) required' });
+    }
+    if (!supabaseConfig?.url || !supabaseConfig?.bucket) {
+      return res.status(400).json({ message: 'supabaseConfig (url, bucket) required' });
+    }
+    const result = await processContactLensReminders(crmConfig, supabaseConfig);
+    res.json({ success: true, ...result });
+  } catch (error) {
+    console.error('Contact lens reminder processing error:', error.message);
+    res.status(500).json({ message: error.message || 'Failed to process reminders' });
+  }
+});
+
+// Daily cron for contact lens reminders — runs at 10:00 AM server time
+const REMINDER_CRON = process.env.REMINDER_CRON || '0 10 * * *';
+cron.schedule(REMINDER_CRON, async () => {
+  console.log(`[${new Date().toISOString()}] Contact lens reminder cron triggered`);
+  const crmConfig = {
+    apiKey: process.env.CRM_API_KEY,
+    locationId: process.env.CRM_LOCATION_ID,
+  };
+  const supabaseConfig = {
+    url: process.env.SUPABASE_URL || 'https://vacmllwtvpehraaosmza.supabase.co',
+    anonKey: process.env.SUPABASE_ANON_KEY || '',
+    bucket: process.env.SUPABASE_BUCKET || 'videos',
+  };
+  if (!crmConfig.apiKey || !crmConfig.locationId) {
+    console.warn('Reminder cron skipped: CRM env vars not set');
+    return;
+  }
+  try {
+    const result = await processContactLensReminders(crmConfig, supabaseConfig);
+    console.log(`Contact lens reminders: ${result.sent} sent, ${result.failed} failed, ${result.checked} checked`);
+  } catch (error) {
+    console.error('Contact lens reminder cron failed:', error.message);
+  }
+});
+console.log(`Contact lens reminder cron scheduled: "${REMINDER_CRON}"`);
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Email proxy - sends an email to a contact via the CRM conversations API
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
