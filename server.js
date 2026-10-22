@@ -9,6 +9,7 @@ import { registerCustomerDocUploadRoute, resolveSupabaseConfig } from './server-
 import { registerGoogleReviewsRoute } from './server-routes-google-reviews.js';
 import { registerContactFormRoute } from './server-routes-contact-form.js';
 import { registerContactLensTrialRoute } from "./server-routes-contact-lens-trials.js";
+import { registerReferralMessagingRoutes } from "./server-routes-referral-messaging.js";
 
 /** Capitalize the first letter of each word in a name (e.g. "john" -> "John"). */
 const capitalizeName = (name) => {
@@ -327,6 +328,8 @@ app.post('/api/generate-brand-description', async (req, res) => {
 // ============================================================
 // CRM ↔ Supabase Bidirectional Sync
 // ============================================================
+
+// (imports moved to top of file)
 
 /**
  * Fetch all contacts from the CRM with pagination.
@@ -659,6 +662,7 @@ registerCustomerDocUploadRoute(app);
 registerGoogleReviewsRoute(app);
 registerContactFormRoute(app);
 registerContactLensTrialRoute(app, downloadCMSFromSupabase, uploadCMSToSupabase);
+registerReferralMessagingRoutes(app);
 
 
 // ============================================================
@@ -1097,7 +1101,7 @@ app.post('/api/crm-upload-custom-file', async (req, res) => {
 
         const blob = new NativeBlob([fileBuffer], { type: fileType || 'application/octet-stream' });
 
-        // CRITICAL: CRM requires the multipart field key to be "<customFieldId>_<fileId>"
+        // CRITICAL: GHL requires the multipart field key to be "<customFieldId>_<fileId>"
         // where fileId is a randomly generated UUID. Appending just the fieldId is
         // silently ignored by the API, which is why files never appeared in the CRM.
         const fileId = crypto.randomUUID();
@@ -1205,41 +1209,6 @@ app.post('/api/crm-contact-add-note', async (req, res) => {
 // Referral SMS — send referral link via text message
 // ============================================================
 
-app.post('/api/send-referral-sms', async (req, res) => {
-  try {
-    const { contactId, locationId, message, apiKey } = req.body;
-
-    if (!contactId || !locationId || !message || !apiKey) {
-      return res.status(400).json({ message: 'contactId, locationId, message, and apiKey are required' });
-    }
-
-    const smsRes = await fetch('https://services.leadconnectorhq.com/conversations/messages', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'Version': '2021-07-28',
-      },
-      body: JSON.stringify({
-        type: 'SMS',
-        locationId,
-        contactId,
-        message,
-      }),
-    });
-
-    if (!smsRes.ok) {
-      const errData = await smsRes.json().catch(() => null);
-      throw new Error(errData?.message || `SMS send failed (${smsRes.status})`);
-    }
-
-    const result = await smsRes.json();
-    res.json({ success: true, messageId: result?.id || result?.messageId || null });
-  } catch (error) {
-    console.error('Referral SMS Error:', error.message);
-    res.status(500).json({ message: error.message || 'Failed to send SMS' });
-  }
-});
 
 // Debug endpoint — dumps raw contact data to see what fields/attachments exist
 app.post('/api/crm-contact-debug', async (req, res) => {
@@ -1650,53 +1619,6 @@ app.get('/api/health', (req, res) => {
 });
 
 // Email proxy - sends an email to a contact via the CRM conversations API
-app.post('/api/send-referral-email', async (req, res) => {
-  try {
-    const { contactId, locationId, subject, message, apiKey } = req.body;
-
-    if (!contactId || !locationId || !message || !apiKey) {
-      return res.status(400).json({
-        message: 'contactId, locationId, message, and apiKey are required',
-      });
-    }
-
-    const emailRes = await fetch(
-      'https://services.leadconnectorhq.com/conversations/messages',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          Version: '2021-07-28',
-        },
-        body: JSON.stringify({
-          type: 'Email',
-          locationId,
-          contactId,
-          subject: subject || '',
-          html: message,
-          message,
-        }),
-      },
-    );
-
-    if (!emailRes.ok) {
-      const errData = await emailRes.json().catch(() => null);
-      throw new Error(
-        errData?.message || `Email send failed (${emailRes.status})`,
-      );
-    }
-
-    const result = await emailRes.json();
-    res.json({
-      success: true,
-      messageId: result?.id || result?.messageId || null,
-    });
-  } catch (error) {
-    console.error('Referral Email Error:', error.message);
-    res.status(500).json({ message: error.message || 'Failed to send email' });
-  }
-});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
