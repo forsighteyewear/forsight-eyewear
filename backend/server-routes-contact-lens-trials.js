@@ -1,21 +1,155 @@
+import { createClient as createSupabaseClient } from '@supabase/supabase-js';
+
 /**
- * Contact Lens Trial — Automated Follow-up & Expiry Messages.
- *
- * A daily cron checks every active contact-lens trial stored in the CMS data
- * (Supabase) and sends the "Follow Up" message 7 days after the appointment
- * date and the "Trial Expiry" message 28 days after the appointment date.
- *
- * Manual triggering is available via POST /api/contact-lens-trials/process.
+ * Resolves the Supabase config to use for an upload/list/delete.
+ * Priority: client-sent config → server environment variables.
+ * This ensures operations work even when the frontend hasn't been
+ * configured with the anon key (the server uses its own env vars).
  */
+export function resolveSupabaseConfig(clientConfig) {
+  const PLACEHOLDERS = ['your_supabase_anon_key', 'your-anon-key', 'placeholder', 'xxx', ''];
+  const isPlaceholder = (v) => !v || PLACEHOLDERS.includes(String(v).trim().toLowerCase());
 
-import cron from 'node-cron';
-import fetch from 'node-fetch';
+  // PREFER the server's own environment variables — they are known-good and
+  // configured on Render. Client-sent config is unreliable (stale/mismatched
+  // anon keys in the browser cause "signature verification failed" JWT
+  // errors). Only fall back to the client config if the server env vars are
+  // not set at all.
+  const envUrl = (process.env.SUPABASE_URL && !isPlaceholder(process.env.SUPABASE_URL)) ? process.env.SUPABASE_URL : '';
+  const envKey = (process.env.SUPABASE_ANON_KEY && !isPlaceholder(process.env.SUPABASE_ANON_KEY)) ? process.env.SUPABASE_ANON_KEY : '';
+  const envBucket = process.env.SUPABASE_BUCKET || 'videos';
 
-const TRIAL_FOLLOWUP_DELAY_DAYS = 7;
-const TRIAL_EXPIRY_DELAY_DAYS = 28;
+  const url = envUrl
+    || (clientConfig?.url && !isPlaceholder(clientConfig.url) ? clientConfig.url : '');
+  const anonKey = envKey
+    || (clientConfig?.anonKey && !isPlaceholder(clientConfig.anonKey) ? clientConfig.anonKey : '');
+  const bucket = envBucket || clientConfig?.bucket || 'videos';
+  return { url, anonKey, bucket };
+}
 
-const DEFAULT_TRIAL_TEMPLATES = {
-  before:
-    "FORSIGHT EYEWEAR – CONTACT LENS APPOINTMENT\n\nHello {firstName},\n\nThis is a reminder of your upcoming contact lens fitting and training appointment.\n\nDate: {appointmentDate}\nTime: {appointmentTime}\nWith: one of our contact lens fitters\nLocation: {storeName}\n\nIMPORTANT – PLEASE READ BEFORE YOUR APPOINTMENT\n\nYOUR FINGERNAILS MUST BE SHORT AND TRIMMED BEFORE YOUR APPOINTMENT.\n\nIF YOUR NAILS ARE TOO LONG, WE WILL NOT BE ABLE TO COMPLETE YOUR CONTACT LENS TRAINING, AND YOUR APPOINTMENT WILL NEED TO BE RESCHEDULED.\n\nPlease also note:\n\n• Arrive on time for your scheduled appointment.\n• Allow 15–60 minutes for your contact lens training.\n• You will learn how to safely insert and remove your contact lenses.\n• If you are unable to complete the training during your appointment, an additional appointment may be required.\n\nACKNOWLEDGEMENT REQUIRED\n\nPlease reply YES to this message to confirm that you have received and read these important instructions.\n\nWe look forward to seeing you!\n\nForsight Eyewear",
-  after:
-    "FORSIGHT EYEWEAR – CONTACT LENS CARE & INSTRUCTIONS\n\nHello {firstName},\n\nThank you for visiting Forsight Eyewear today for your contact lens fitting and training appointment!\n\nWe hope you're enjoying your new contact lenses.\n\nIMPORTANT – CARING FOR YOUR CONTACT LENSES\n\nYour eye health and comfort are our priorities. Please remember the instructions provided during your appointment.\n\n1. INSERTING & REMOVING YOUR LENSES\n\nAlways wash and thoroughly dry your hands before handling your lenses.\n\nFollow the insertion and removal techniques demonstrated during your appointment.\n\nNever force a lens into or out of your eye.\n\nIf you're having difficulty, contact our clinic for assistance.\n\n2. WEARING YOUR TRIAL LENSES\n\nFollow the wearing schedule provided by your eye-care professional.\n\nNever sleep in your contact lenses unless specifically instructed by your eye-care professional.\n\nNever use tap water or saliva to clean or store contact lenses.\n\nFollow the specific replacement and care instructions for your prescribed lens type.\n\n3. COMFORT & VISION\n\nAs you become accustomed to your new lenses, please pay attention to:\n\nOverall comfort\n\nClarity of vision\n\nDryness or irritation\n\nAny difficulties inserting or removing your lenses\n\nIMPORTANT: If you experience eye pain, significant redness, unusual light sensitivity or changes in vision, remove your lenses immediately and seek prompt professional eye care.\n\n4. YOUR TRIAL PERIOD\n\nYour contact lens trial allows you to evaluate comfort and vision before purchasing your lenses.\n\nPLEASE NOTE: You have 45 days from your fitting appointment to place your contact lens order. After this period, another fitting assessment will be required.\n\n5. WE'LL CHECK IN WITH YOU\n\nWe'll send you a short follow-up message in approximately 7 days to see how you're doing.\n\nIf you experience any difficulties before then, please contact us at {storePhone}.\n\nPLEASE REPLY YES to acknowledge that you have received these instructions.\n\nThank you for choosing Forsight Eyewear!\n\nWe're here to help you see clearly and comfortably. — {storeName}",
+/**
+ * Registers all customer-documents routes on an Express app:
+ *   POST /api/customer-documents/upload  — upload a base64 file
+ *   POST /api/customer-documents/list    — list docs for a client
+ *   POST /api/customer-documents/delete  — delete a doc by path
+ *
+ * All routes resolve config from client-sent values first, then fall
+ * back to server env vars (SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_BUCKET).
+ */
+export function registerCustomerDocUploadRoute(app) {
+  // ---- Upload ----
+  app.post('/api/customer-documents/upload', async (req, res) => {
+    try {
+      const { supabaseConfig: clientConfig, clientId, category, fileName, fileType, fileData } = req.body;
+      if (!clientId || !fileName || !fileData) {
+        return res.status(400).json({ message: 'clientId, fileName, and fileData are required' });
+      }
+
+      const supabaseConfig = resolveSupabaseConfig(clientConfig);
+      if (!supabaseConfig.url || !supabaseConfig.anonKey || !supabaseConfig.bucket) {
+        return res.status(400).json({
+          message:
+            'Supabase config required. Set SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_BUCKET as environment variables on this server (Render), or configure them in Admin → CRM & Settings → Storage.',
+        });
+      }
+
+      const supabase = createSupabaseClient(supabaseConfig.url, supabaseConfig.anonKey);
+
+      const safeName = (fileName || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+      const cat = category || 'General';
+      const storageName = `${clientId}__${cat}__${Date.now()}_${safeName}`;
+      const storagePath = `customer-docs/${storageName}`;
+
+      // fileData is a data: URL — strip the prefix and decode base64
+      const matches = /^data:([a-zA-Z0-9/.+-]+);base64,(.*)$/.exec(fileData);
+      if (!matches) {
+        return res.status(400).json({ message: 'fileData must be a base64 data URL' });
+      }
+      const contentType = fileType || matches[1] || 'application/octet-stream';
+      const buffer = Buffer.from(matches[2], 'base64');
+
+      const { error } = await supabase.storage
+        .from(supabaseConfig.bucket)
+        .upload(storagePath, buffer, {
+          contentType,
+          cacheControl: '3600',
+          upsert: false,
+        });
+
+      if (error) throw error;
+
+      const publicUrl = `${supabaseConfig.url}/storage/v1/object/public/${supabaseConfig.bucket}/${storagePath}`;
+      res.json({
+        success: true,
+        storageName,
+        fileName,
+        fileType: contentType,
+        url: publicUrl,
+        path: storagePath,
+      });
+    } catch (error) {
+      console.error('[customer-documents/upload] Error:', error.message);
+      res.status(500).json({ message: error.message || 'Failed to upload document' });
+    }
+  });
+
+  // ---- List ----
+  app.post('/api/customer-documents/list', async (req, res) => {
+    try {
+      const { supabaseConfig: clientConfig, clientId } = req.body;
+      const supabaseConfig = resolveSupabaseConfig(clientConfig);
+      if (!supabaseConfig.url || !supabaseConfig.anonKey || !supabaseConfig.bucket) {
+        return res.status(400).json({
+          message:
+            'Supabase config required. Set SUPABASE_URL, SUPABASE_ANON_KEY, and SUPABASE_BUCKET as environment variables on this server (Render), or configure them in Admin → CRM & Settings → Storage.',
+        });
+      }
+      const supabase = createSupabaseClient(supabaseConfig.url, supabaseConfig.anonKey);
+      const { data: files, error } = await supabase.storage
+        .from(supabaseConfig.bucket)
+        .list('customer-docs', { limit: 500, sortBy: { column: 'created_at', order: 'desc' } });
+
+      if (error) throw error;
+
+      const docs = (files || [])
+        .filter((f) => (clientId ? f.name.startsWith(clientId + '__') : true))
+        .map((f) => {
+          const parts = f.name.split('__');
+          return {
+            id: f.id || f.name,
+            fileName: parts.slice(2).join('__') || f.name,
+            fileType: f.metadata?.mimetype || 'application/octet-stream',
+            fileSize: f.metadata?.size || 0,
+            uploadedAt: f.created_at || new Date().toISOString(),
+            category: parts[1] || 'General',
+            url: `${supabaseConfig.url}/storage/v1/object/public/${supabaseConfig.bucket}/customer-docs/${encodeURIComponent(f.name)}`,
+            path: `customer-docs/${f.name}`,
+          };
+        });
+
+      res.json({ success: true, documents: docs });
+    } catch (error) {
+      res.status(500).json({ message: error.message || 'Failed to list documents' });
+    }
+  });
+
+  // ---- Delete ----
+  app.post('/api/customer-documents/delete', async (req, res) => {
+    try {
+      const { supabaseConfig: clientConfig, path } = req.body;
+      if (!path) {
+        return res.status(400).json({ message: 'File path required' });
+      }
+      const supabaseConfig = resolveSupabaseConfig(clientConfig);
+      if (!supabaseConfig.url || !supabaseConfig.anonKey || !supabaseConfig.bucket) {
+        return res.status(400).json({ message: 'Supabase config required' });
+      }
+      const supabase = createSupabaseClient(supabaseConfig.url, supabaseConfig.anonKey);
+      const { error } = await supabase.storage.from(supabaseConfig.bucket).remove([path]);
+      if (error) throw error;
+      res.json({ success: true });
+    } catch (error) {
+      res.status(500).json({ message: error.message || 'Failed to delete document' });
+    }
+  });
+}
